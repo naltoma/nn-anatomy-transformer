@@ -1,0 +1,23 @@
+[project]
+name = "nn-anatomy-transformer"
+version = "0.1.0"
+description = "Transformer 動作可視化シミュレータ (教育用、行列セル単位)。MLP 版 nn-anatomy の姉妹プロジェクト。"
+requires-python = ">=3.10"
+dependencies = [
+    # numpy: 参照実装 (matmul / softmax / layerNorm / gelu / Self-Attention forward) と
+    # tools/build_preset.py の hand-crafted 重み構築に使う。
+    # PyTorch は使わない (preset を SGD 学習しないため autograd 不要、
+    # 参照実装も式が単純で numpy で 1e-12 一致を達成できる)。
+    "numpy>=1.24",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+# このプロジェクトはアプリケーション (= ライブラリではない) なので、
+# uv にも「パッケージ化しない」と伝える。
+# こう書いておくと `uv sync` が build-system を要求せずに依存だけ揃える。
+[tool.uv]
+package = false

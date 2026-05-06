@@ -1,0 +1,6 @@
+{
+  "name": "nn-anatomy-transformer-js",
+  "private": true,
+  "type": "module",
+  "description": "Transformer simulator (JS side). No runtime dependencies; tests use Node.js built-in node:test."
+}

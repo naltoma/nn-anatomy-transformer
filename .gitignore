@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+dist/
+wheels/
+*.egg-info
+# 注: 本プロジェクトの build/ は Python パッケージングではなく
+# tools/bundle.py が出す build/nn_sim_transformer.html (配布用 単一 HTML) を入れる場所。
+# README は clone 直後に build/nn_sim_transformer.html を直接開く想定なので除外しない。
+
+# Virtual environments
+.venv
+
+# Test runners
+.pytest_cache/
+pytest-cache-files-*/
+
+# Node.js
+node_modules/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
+*~
+
+# Environment / secrets (念のため)
+.env
+.env.*
+!.env.example
+
+# Coverage report (将来的に pytest-cov / c8 を入れた場合)
+.coverage
+coverage/
+htmlcov/

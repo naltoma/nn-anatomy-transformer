@@ -1,0 +1,3 @@
+# このフォルダには、tools/build_preset.py が生成する preset JSON が入る。
+# v1 時点では japanese-mini-v1.json (Multi-Head + 残差 + LN + FFN, 47 KB) のみ。
+# 多 preset 切替を v2 で導入する場合は別 preset をここに追加する想定。

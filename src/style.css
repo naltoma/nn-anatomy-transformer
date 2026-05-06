@@ -1,0 +1,392 @@
+/* NN Anatomy — Transformer 版 スタイル
+ * 設計書 §4 (画面レイアウト) と §7 (可視化) に対応。
+ * 3 領域 grid: コントロールバー (上) / ネットワーク・ビュー (中央左) / 補助パネル (右)。
+ */
+
+:root {
+  --bg: #fafafa;
+  --pane-bg: #ffffff;
+  --border: #d8d8d8;
+  --fg: #222;
+  --fg-muted: #6b6b6b;
+  --selected: #f59e0b;
+  --pos: #2b6cb0;       /* セル正値 (赤系/青系どちらにも変えられる) */
+  --neg: #c53030;
+  --attn-fill: #2b6cb0; /* Attention map 用の単一色 (青濃淡) */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
+               "Noto Sans CJK JP", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+/* 行列ヒートマップは横長 (T=5 × d_model=16 = 800 px 幅) なので、
+   左右分割ではなく上下分割で「メインビューに画面幅をフルに使わせる」レイアウトを採用。
+   - 1 段目: コントロールバー (auto 高さ)
+   - 2 段目: ネットワーク・ビュー (1fr、可変。フル幅で行列を表示)
+   - 3 段目: 補助パネル (固定 320 px、式の展開・Attention Map・レッスン・ログを横タブで切替) */
+body {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto 1fr 320px;
+  grid-template-areas:
+    "controls"
+    "network"
+    "side";
+  gap: 8px;
+  padding: 8px;
+}
+
+.pane {
+  background: var(--pane-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  overflow: hidden;
+}
+
+.pane-controls { grid-area: controls; }
+.pane-network  { grid-area: network; position: relative; }
+.pane-side     { grid-area: side; display: flex; flex-direction: column; min-height: 0; }
+
+/* ── コントロールバー ───────────────────────────────────── */
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.row select, .row input[type="text"], .row input[type="number"] {
+  padding: 2px 6px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  font-family: inherit;
+}
+.row button {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: #f5f5f5;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.row button:hover:not(:disabled) { background: #ebebeb; }
+.row button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.spacer { flex: 1; }
+
+.phase-badge {
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-family: monospace;
+}
+.phase-badge #phase-label {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+/* ── タブ ───────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.tab {
+  padding: 6px 12px;
+  font-size: 12px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  color: var(--fg-muted);
+}
+.tab:hover { color: var(--fg); }
+.tab.tab-active {
+  color: var(--fg);
+  font-weight: 600;
+  border-bottom-color: var(--selected);
+}
+
+.tab-panel { display: none; flex: 1; overflow: auto; padding: 4px; }
+.tab-panel.tab-panel-active { display: block; }
+
+/* ── ネットワーク・ビュー ───────────────────────────────── */
+
+.pane-network { display: flex; flex-direction: column; }
+
+.zoom-controls {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  z-index: 5;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.zoom-controls button {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  background: #f5f5f5;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.zoom-controls button:hover { background: #ebebeb; }
+.zoom-label {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--fg-muted);
+  min-width: 38px;
+  text-align: right;
+}
+
+#net-svg {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#net-svg.dragging { cursor: grabbing; }
+
+/* SVG 内部要素 */
+
+.matrix-label {
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--fg);
+}
+.matrix-shape-label {
+  font-family: monospace;
+  font-size: 10px;
+  fill: var(--fg-muted);
+}
+.row-label {
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 11px;
+  fill: var(--fg);
+  text-anchor: end;
+}
+.col-label {
+  font-family: monospace;
+  font-size: 9px;
+  fill: var(--fg-muted);
+  text-anchor: middle;
+}
+.cell-rect {
+  stroke: #d8d8d8;
+  stroke-width: 0.5;
+}
+.cell-rect:hover {
+  stroke: var(--selected);
+  stroke-width: 1.5;
+}
+.cell-rect.cell-selected {
+  stroke: var(--selected);
+  stroke-width: 2;
+}
+.cell-text {
+  font-family: monospace;
+  font-size: 9px;
+  fill: var(--fg);
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+/* Attention map: 単色青濃淡。値が大きいほど濃い青 */
+.attn-cell-text {
+  fill: var(--fg);
+  font-weight: 600;
+}
+.attn-cell-text.dark {
+  fill: #fff;
+}
+
+/* ── 補助パネル ────────────────────────────────────────── */
+
+.pane-side .tab-panel {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.muted { color: var(--fg-muted); font-size: 12px; }
+.event-log {
+  font-family: monospace;
+  font-size: 11px;
+  margin: 0;
+  padding-left: 24px;
+  list-style: decimal;
+}
+.event-log li { padding: 2px 0; color: var(--fg); }
+
+/* ── 「式の展開」パネル ────────────────────────────────── */
+
+.explain-section { padding: 4px 0; }
+.explain-section h4 {
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+.explain-section h4.step-h {
+  font-size: 12px;
+  color: var(--fg-muted);
+  margin-top: 6px;
+}
+.math {
+  background: #f5f7f9;
+  border: 1px solid #e3e6ea;
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.math .line { padding: 1px 0; }
+.math .line + .line { margin-top: 2px; }
+.mnum {
+  font-family: monospace;
+  background: #fff;
+  padding: 0 3px;
+  border-radius: 2px;
+  border: 1px solid #e0e0e0;
+}
+.mop {
+  color: var(--fg-muted);
+  margin: 0 1px;
+}
+.muted.note {
+  font-size: 11px;
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: #fffbe6;
+  border-left: 2px solid #f0c040;
+  border-radius: 2px;
+}
+.comment {
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* ── レッスンカード ──────────────────────────────────── */
+
+.lesson-card {
+  padding: 4px;
+}
+.lesson-card h3 {
+  margin: 0 0 4px 0;
+  font-size: 14px;
+}
+.lesson-card .lesson-hint {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 6px 10px;
+  background: #f5f7f9;
+  border-left: 3px solid var(--selected);
+  border-radius: 2px;
+  /* hint 内に \n を入れると改行、\n\n で段落区切りとして描画される。 */
+  white-space: pre-line;
+}
+.lesson-card h4 {
+  margin: 8px 0 4px 0;
+  font-size: 13px;
+}
+.lesson-card ol.lesson-checks {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg);
+}
+.lesson-card ol.lesson-checks li {
+  padding: 4px 0;
+  /* lesson check 内に \n\n を入れると段落区切りとして描画される
+     (例: 💡 補足 を別段落に分けるため)。 */
+  white-space: pre-line;
+}
+
+/* ── Attention Map (補助パネル常駐表示) ──────────────── */
+
+.attmap-table {
+  border-collapse: collapse;
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 11px;
+}
+.attmap-table th, .attmap-table td {
+  border: 1px solid #d8d8d8;
+  padding: 4px 8px;
+  text-align: center;
+}
+.attmap-table th { background: #f5f5f5; font-weight: 600; }
+.attmap-cell {
+  font-family: monospace;
+  font-weight: 600;
+  min-width: 56px;
+}
+.attmap-head {
+  margin-bottom: 8px;
+}
+.attmap-head-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin: 6px 0 2px 0;
+  color: var(--muted);
+}
+
+/* ── Q·K dim 抜粋表 (scores セルクリック時の補助) ─────── */
+
+.qk-excerpt {
+  margin: 8px 0;
+  padding: 6px 8px;
+  background: #f7f9fb;
+  border-left: 3px solid var(--selected);
+  border-radius: 2px;
+}
+.qk-excerpt-cap {
+  margin: 0 0 4px 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.qk-pair-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: monospace;
+}
+.qk-pair-table th, .qk-pair-table td {
+  border: 1px solid #d8d8d8;
+  padding: 2px 6px;
+  text-align: center;
+  min-width: 48px;
+}
+.qk-pair-table thead th { background: #eef0f2; font-weight: 600; }
+.qk-pair-table tbody th { background: #f5f5f5; font-weight: 600; text-align: right; }
+.qk-pair-table .qk-prod-row td { background: #fff8e1; font-weight: 600; }

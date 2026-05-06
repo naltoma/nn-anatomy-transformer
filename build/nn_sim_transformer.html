@@ -1,0 +1,3473 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NN Anatomy — Transformer</title>
+    <style>
+/* NN Anatomy — Transformer 版 スタイル
+ * 設計書 §4 (画面レイアウト) と §7 (可視化) に対応。
+ * 3 領域 grid: コントロールバー (上) / ネットワーク・ビュー (中央左) / 補助パネル (右)。
+ */
+
+:root {
+  --bg: #fafafa;
+  --pane-bg: #ffffff;
+  --border: #d8d8d8;
+  --fg: #222;
+  --fg-muted: #6b6b6b;
+  --selected: #f59e0b;
+  --pos: #2b6cb0;       /* セル正値 (赤系/青系どちらにも変えられる) */
+  --neg: #c53030;
+  --attn-fill: #2b6cb0; /* Attention map 用の単一色 (青濃淡) */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
+               "Noto Sans CJK JP", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+/* 行列ヒートマップは横長 (T=5 × d_model=16 = 800 px 幅) なので、
+   左右分割ではなく上下分割で「メインビューに画面幅をフルに使わせる」レイアウトを採用。
+   - 1 段目: コントロールバー (auto 高さ)
+   - 2 段目: ネットワーク・ビュー (1fr、可変。フル幅で行列を表示)
+   - 3 段目: 補助パネル (固定 320 px、式の展開・Attention Map・レッスン・ログを横タブで切替) */
+body {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto 1fr 320px;
+  grid-template-areas:
+    "controls"
+    "network"
+    "side";
+  gap: 8px;
+  padding: 8px;
+}
+
+.pane {
+  background: var(--pane-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  overflow: hidden;
+}
+
+.pane-controls { grid-area: controls; }
+.pane-network  { grid-area: network; position: relative; }
+.pane-side     { grid-area: side; display: flex; flex-direction: column; min-height: 0; }
+
+/* ── コントロールバー ───────────────────────────────────── */
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.row select, .row input[type="text"], .row input[type="number"] {
+  padding: 2px 6px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  font-family: inherit;
+}
+.row button {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: #f5f5f5;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.row button:hover:not(:disabled) { background: #ebebeb; }
+.row button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.spacer { flex: 1; }
+
+.phase-badge {
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-family: monospace;
+}
+.phase-badge #phase-label {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+/* ── タブ ───────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.tab {
+  padding: 6px 12px;
+  font-size: 12px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  color: var(--fg-muted);
+}
+.tab:hover { color: var(--fg); }
+.tab.tab-active {
+  color: var(--fg);
+  font-weight: 600;
+  border-bottom-color: var(--selected);
+}
+
+.tab-panel { display: none; flex: 1; overflow: auto; padding: 4px; }
+.tab-panel.tab-panel-active { display: block; }
+
+/* ── ネットワーク・ビュー ───────────────────────────────── */
+
+.pane-network { display: flex; flex-direction: column; }
+
+.zoom-controls {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  z-index: 5;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.zoom-controls button {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  background: #f5f5f5;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.zoom-controls button:hover { background: #ebebeb; }
+.zoom-label {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--fg-muted);
+  min-width: 38px;
+  text-align: right;
+}
+
+#net-svg {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#net-svg.dragging { cursor: grabbing; }
+
+/* SVG 内部要素 */
+
+.matrix-label {
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  fill: var(--fg);
+}
+.matrix-shape-label {
+  font-family: monospace;
+  font-size: 10px;
+  fill: var(--fg-muted);
+}
+.row-label {
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 11px;
+  fill: var(--fg);
+  text-anchor: end;
+}
+.col-label {
+  font-family: monospace;
+  font-size: 9px;
+  fill: var(--fg-muted);
+  text-anchor: middle;
+}
+.cell-rect {
+  stroke: #d8d8d8;
+  stroke-width: 0.5;
+}
+.cell-rect:hover {
+  stroke: var(--selected);
+  stroke-width: 1.5;
+}
+.cell-rect.cell-selected {
+  stroke: var(--selected);
+  stroke-width: 2;
+}
+.cell-text {
+  font-family: monospace;
+  font-size: 9px;
+  fill: var(--fg);
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+/* Attention map: 単色青濃淡。値が大きいほど濃い青 */
+.attn-cell-text {
+  fill: var(--fg);
+  font-weight: 600;
+}
+.attn-cell-text.dark {
+  fill: #fff;
+}
+
+/* ── 補助パネル ────────────────────────────────────────── */
+
+.pane-side .tab-panel {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.muted { color: var(--fg-muted); font-size: 12px; }
+.event-log {
+  font-family: monospace;
+  font-size: 11px;
+  margin: 0;
+  padding-left: 24px;
+  list-style: decimal;
+}
+.event-log li { padding: 2px 0; color: var(--fg); }
+
+/* ── 「式の展開」パネル ────────────────────────────────── */
+
+.explain-section { padding: 4px 0; }
+.explain-section h4 {
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+.explain-section h4.step-h {
+  font-size: 12px;
+  color: var(--fg-muted);
+  margin-top: 6px;
+}
+.math {
+  background: #f5f7f9;
+  border: 1px solid #e3e6ea;
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.math .line { padding: 1px 0; }
+.math .line + .line { margin-top: 2px; }
+.mnum {
+  font-family: monospace;
+  background: #fff;
+  padding: 0 3px;
+  border-radius: 2px;
+  border: 1px solid #e0e0e0;
+}
+.mop {
+  color: var(--fg-muted);
+  margin: 0 1px;
+}
+.muted.note {
+  font-size: 11px;
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: #fffbe6;
+  border-left: 2px solid #f0c040;
+  border-radius: 2px;
+}
+.comment {
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* ── レッスンカード ──────────────────────────────────── */
+
+.lesson-card {
+  padding: 4px;
+}
+.lesson-card h3 {
+  margin: 0 0 4px 0;
+  font-size: 14px;
+}
+.lesson-card .lesson-hint {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 6px 10px;
+  background: #f5f7f9;
+  border-left: 3px solid var(--selected);
+  border-radius: 2px;
+  /* hint 内に \n を入れると改行、\n\n で段落区切りとして描画される。 */
+  white-space: pre-line;
+}
+.lesson-card h4 {
+  margin: 8px 0 4px 0;
+  font-size: 13px;
+}
+.lesson-card ol.lesson-checks {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg);
+}
+.lesson-card ol.lesson-checks li {
+  padding: 4px 0;
+  /* lesson check 内に \n\n を入れると段落区切りとして描画される
+     (例: 💡 補足 を別段落に分けるため)。 */
+  white-space: pre-line;
+}
+
+/* ── Attention Map (補助パネル常駐表示) ──────────────── */
+
+.attmap-table {
+  border-collapse: collapse;
+  font-family: -apple-system, "Hiragino Kaku Gothic ProN", "Noto Sans CJK JP", sans-serif;
+  font-size: 11px;
+}
+.attmap-table th, .attmap-table td {
+  border: 1px solid #d8d8d8;
+  padding: 4px 8px;
+  text-align: center;
+}
+.attmap-table th { background: #f5f5f5; font-weight: 600; }
+.attmap-cell {
+  font-family: monospace;
+  font-weight: 600;
+  min-width: 56px;
+}
+.attmap-head {
+  margin-bottom: 8px;
+}
+.attmap-head-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin: 6px 0 2px 0;
+  color: var(--muted);
+}
+
+/* ── Q·K dim 抜粋表 (scores セルクリック時の補助) ─────── */
+
+.qk-excerpt {
+  margin: 8px 0;
+  padding: 6px 8px;
+  background: #f7f9fb;
+  border-left: 3px solid var(--selected);
+  border-radius: 2px;
+}
+.qk-excerpt-cap {
+  margin: 0 0 4px 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.qk-pair-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: monospace;
+}
+.qk-pair-table th, .qk-pair-table td {
+  border: 1px solid #d8d8d8;
+  padding: 2px 6px;
+  text-align: center;
+  min-width: 48px;
+}
+.qk-pair-table thead th { background: #eef0f2; font-weight: 600; }
+.qk-pair-table tbody th { background: #f5f5f5; font-weight: 600; text-align: right; }
+.qk-pair-table .qk-prod-row td { background: #fff8e1; font-weight: 600; }
+
+</style>
+  </head>
+  <body>
+    <!-- [A] コントロールバー ────────────────────────────────── -->
+    <header id="controls" class="pane pane-controls">
+      <div class="row">
+        <label>
+          Lesson
+          <select id="lesson">
+            <option value="" selected>— (custom)</option>
+            <!-- controller.js が LESSONS から option を生成 -->
+          </select>
+        </label>
+
+        <label>
+          Sample
+          <select id="sample">
+            <!-- controller.js が tokenizer の SAMPLE_SENTENCES から生成 -->
+          </select>
+        </label>
+
+        <button id="btn-forward">Forward</button>
+        <button id="btn-reset">Reset</button>
+
+        <span class="spacer"></span>
+
+        <span class="phase-badge">
+          phase: <span id="phase-label">idle</span>
+        </span>
+      </div>
+    </header>
+
+    <!-- [B] ネットワーク・ビュー ───────────────────────────── -->
+    <main id="network" class="pane pane-network">
+      <nav class="tabs view-tabs" role="tablist">
+        <button class="tab tab-active" data-view-tab="embed">Embed</button>
+        <button class="tab" data-view-tab="qkv">Q/K/V</button>
+        <button class="tab" data-view-tab="attn">Attn</button>
+        <button class="tab" data-view-tab="out">Out</button>
+        <button class="tab" data-view-tab="ffn">FFN</button>
+      </nav>
+      <div class="zoom-controls">
+        <button id="btn-zoom-fit" title="全体表示にリセット">⤢ Fit</button>
+        <button id="btn-zoom-100" title="100% 表示">100%</button>
+        <button id="btn-zoom-out" title="−10% (中心アンカー)">−10%</button>
+        <button id="btn-zoom-in"  title="+10% (中心アンカー)">+10%</button>
+        <span id="zoom-label" class="zoom-label">1.0×</span>
+      </div>
+      <svg id="net-svg" role="img" aria-label="transformer matrices">
+        <!-- view.js が描画する -->
+      </svg>
+    </main>
+
+    <!-- [C] 補助パネル ────────────────────────────────────── -->
+    <aside id="side" class="pane pane-side">
+      <nav class="tabs side-tabs" role="tablist">
+        <button class="tab tab-active" data-side-tab="explain">式の展開</button>
+        <button class="tab" data-side-tab="attmap">Attention Map</button>
+        <button class="tab" data-side-tab="lesson">レッスン</button>
+        <button class="tab" data-side-tab="log">イベントログ</button>
+      </nav>
+
+      <section class="tab-panel tab-panel-active" data-side-panel="explain">
+        <div id="explain-body">
+          <p class="muted">
+            行列のセル (例: Q[T2 美しい, 3]) をクリックすると、ここにそのセルの計算式が表示されます (P5 で実装予定)。
+          </p>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-side-panel="attmap">
+        <div id="attmap-body">
+          <p class="muted">
+            Forward 後、Attention Map (T × T) がここに常駐表示されます (P5 で実装予定)。
+          </p>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-side-panel="lesson">
+        <div id="lesson-body">
+          <p class="muted">
+            Lesson セレクタから Lesson 1〜Lesson 10 を選ぶと、ここに目的と「このレッスンでチェックすること (3 つ)」が表示されます。
+          </p>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-side-panel="log">
+        <ol id="event-log" class="event-log"></ol>
+      </section>
+    </aside>
+
+    <script type="module">
+// === bundled by tools/bundle.py — 直接編集しないこと ===
+// src/js/*.js を依存順に連結し、import 文を削除し、`export ` を剥がした。
+// 詳細: tools/bundle.py のモジュール docstring を参照。
+
+// ---------- rng.js ----------
+
+// rng.js — 単一マスター seed から独立なサブストリームを導出する。
+// 設計書 §6.5 / §6.6 に対応。ES modules。
+
+/**
+ * サブストリーム tag。将来 v2 でバッチシャッフル等を足すときは
+ * ここに SHUFFLE などを追記するだけ。
+ */
+const SUB = Object.freeze({
+  WEIGHTS: 0xa5a5a5a5,
+  DATA: 0x5a5a5a5a,
+});
+
+/**
+ * Mulberry32: 32-bit 状態の軽量 PRNG。
+ * seed → [0,1) を返す関数 (以降 rng と呼ぶ)。
+ * 同じ seed からは必ず同じ列を返す (bitwise 一致)。
+ */
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t = (t + 0x6d2b79f5) >>> 0;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * 標準正規分布からのサンプリング (Box-Muller)。
+ * rng は mulberry32() などの [0,1) 返す関数。
+ * 1 回呼ぶごとに rng を 2 回消費する。
+ */
+function randn(rng) {
+  const u1 = Math.max(rng(), 1e-12); // log(0) ガード
+  const u2 = rng();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+/**
+ * マスター seed と tag からサブシードを導出する。
+ * XOR だけ。Mulberry32 側の状態発散が十分カオティックなので相関は実用上ゼロ。
+ */
+function deriveSubSeed(masterSeed, tag) {
+  return ((masterSeed >>> 0) ^ (tag >>> 0)) >>> 0;
+}
+
+/**
+ * ユーザーがシードを指定しなかったときの自動 seed。
+ * Date.now() は秒単位で粗いので Math.random() と XOR して混ぜる。
+ * 本関数の戻り値は必ず seedUsed として記録し、ログ・JSON に残すこと。
+ */
+function autoSeed() {
+  return (Date.now() ^ Math.floor(Math.random() * 2 ** 31)) >>> 0;
+}
+
+
+// ---------- tokenizer.js ----------
+
+// tokenizer.js — 16 語固定の日本語語彙。
+// 設計書 §6.1 vocabulary 表に対応。長さ T=5 のサンプル文 (§6.2) も同梱。
+
+/**
+ * 語彙 (id 0..15)。順序は設計書 §6.1 と同じ。
+ *   0-2: 指示詞・代名詞
+ *   3-6: 名詞
+ *   7-9: 形容詞
+ *   10-11: 動詞
+ *   12-14: 助詞
+ *   15: コピュラ
+ */
+const VOCAB = Object.freeze([
+  "これ",   //  0
+  "それ",   //  1
+  "私",     //  2
+  "猫",     //  3
+  "花",     //  4
+  "本",     //  5
+  "小説",   //  6
+  "大きい", //  7
+  "美しい", //  8
+  "人気",   //  9
+  "読む",   // 10
+  "好き",   // 11
+  "は",     // 12
+  "が",     // 13
+  "を",     // 14
+  "です",   // 15
+]);
+
+const VOCAB_SIZE = VOCAB.length;
+
+/** 単語 → ID の逆引き表。Object.create(null) で prototype 汚染を避ける。 */
+const WORD2ID = (() => {
+  const m = Object.create(null);
+  for (let i = 0; i < VOCAB.length; i++) m[VOCAB[i]] = i;
+  return Object.freeze(m);
+})();
+
+/**
+ * 単語を ID に。語彙外の単語が来たらエラー。
+ * @param {string} word
+ * @returns {number}
+ */
+function word2id(word) {
+  if (!(word in WORD2ID)) {
+    throw new Error(`Unknown word: ${JSON.stringify(word)}`);
+  }
+  return WORD2ID[word];
+}
+
+/**
+ * ID を単語に。範囲外の ID が来たらエラー。
+ * @param {number} id
+ * @returns {string}
+ */
+function id2word(id) {
+  if (!Number.isInteger(id) || id < 0 || id >= VOCAB.length) {
+    throw new Error(`id out of range: ${id}`);
+  }
+  return VOCAB[id];
+}
+
+/**
+ * 単語列を ID 列 (Int32Array) に変換。
+ * @param {string[]} words
+ * @returns {Int32Array}
+ */
+function encode(words) {
+  const out = new Int32Array(words.length);
+  for (let i = 0; i < words.length; i++) out[i] = word2id(words[i]);
+  return out;
+}
+
+/**
+ * ID 列を単語列に変換。
+ * @param {Int32Array | number[]} ids
+ * @returns {string[]}
+ */
+function decode(ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i++) out.push(id2word(ids[i]));
+  return out;
+}
+
+/**
+ * 設計書 §6.2 のサンプル文 8 つ (T=5 固定)。
+ * デフォルト preset (japanese-mini-v1) もこれら 8 文の next-token prediction で
+ * 学習される。UI の Sentence セレクタからこれらを直接選べるようにする想定。
+ */
+const SAMPLE_SENTENCES = Object.freeze([
+  Object.freeze(["これ", "は", "美しい", "花", "です"]),
+  Object.freeze(["それ", "は", "人気", "小説", "です"]),
+  Object.freeze(["私",   "は", "猫",     "が", "好き"]),
+  Object.freeze(["私",   "は", "本",     "を", "読む"]),
+  Object.freeze(["私",   "は", "小説",   "を", "読む"]),
+  Object.freeze(["大きい", "猫", "は", "美しい", "です"]),
+  Object.freeze(["美しい", "花", "は", "人気",   "です"]),
+  Object.freeze(["これ", "は", "大きい", "本", "です"]),
+]);
+
+
+// ---------- matrix.js ----------
+
+// matrix.js — flat-array ベースの行列演算ヘルパ。
+//
+// すべての行列は Float64Array の 1 次元配列で、(rows, cols) の組と一緒に渡す。
+// アクセスは A[r * cols + c]。
+// このスタイルは Transformer のような matmul 中心の計算で速く、
+// 後で WebGPU / SIMD 化する場合にも転用しやすい。
+//
+// 数値検証は tests/js/test_matrix.test.mjs で PyTorch fixture (float64) と
+// 1e-12 オーダで一致することを担保している。
+
+/**
+ * 行列積 C = A · B
+ *   A: shape (M, K), B: shape (K, N) → C: shape (M, N)
+ * すべて Float64Array。out が省略されたら新しく確保して返す。
+ *
+ * 実装は素朴な 3 重ループ。教育用の規模 (T=5, d_model=16) では十分。
+ */
+function matmul(A, M, K, B, N, out) {
+  const C = out ?? new Float64Array(M * N);
+  for (let i = 0; i < M; i++) {
+    for (let j = 0; j < N; j++) {
+      let s = 0;
+      for (let k = 0; k < K; k++) {
+        s += A[i * K + k] * B[k * N + j];
+      }
+      C[i * N + j] = s;
+    }
+  }
+  return C;
+}
+
+/**
+ * 行ごとの softmax。x: (rows, cols) → 各行を独立に softmax。
+ * 数値安定化のため、行ごとの max を引いてから exp する (overflow 防止)。
+ * PyTorch の torch.softmax(x, dim=-1) と数値一致する。
+ */
+function softmax(x, rows, cols, out) {
+  const y = out ?? new Float64Array(rows * cols);
+  for (let r = 0; r < rows; r++) {
+    const off = r * cols;
+    // 行ごとの max
+    let m = -Infinity;
+    for (let c = 0; c < cols; c++) {
+      const v = x[off + c];
+      if (v > m) m = v;
+    }
+    // exp(x - m) と総和
+    let s = 0;
+    for (let c = 0; c < cols; c++) {
+      const e = Math.exp(x[off + c] - m);
+      y[off + c] = e;
+      s += e;
+    }
+    // 正規化
+    const inv = 1 / s;
+    for (let c = 0; c < cols; c++) {
+      y[off + c] *= inv;
+    }
+  }
+  return y;
+}
+
+/**
+ * 行ごとの LayerNorm (PyTorch の F.layer_norm と同等):
+ *   mean   = sum(x_r) / cols
+ *   var    = sum((x_r - mean)^2) / cols    (バイアス補正なし、PyTorch と同じ)
+ *   y_r    = (x_r - mean) / sqrt(var + eps) * gamma + beta
+ *
+ * gamma, beta は長さ cols のベクトル (Float64Array)。
+ * eps のデフォルトは PyTorch と揃えて 1e-5。
+ *
+ * 注: PyTorch の var は分母が cols (有偏) なので Math.sqrt(var + eps) は
+ *     1/cols の分散基準。これに合わせるのが大事 (1/(cols-1) ではない)。
+ */
+function layerNorm(x, rows, cols, gamma, beta, eps = 1e-5, out) {
+  const y = out ?? new Float64Array(rows * cols);
+  const invCols = 1 / cols;
+  for (let r = 0; r < rows; r++) {
+    const off = r * cols;
+    // mean
+    let mean = 0;
+    for (let c = 0; c < cols; c++) mean += x[off + c];
+    mean *= invCols;
+    // variance
+    let varSum = 0;
+    for (let c = 0; c < cols; c++) {
+      const d = x[off + c] - mean;
+      varSum += d * d;
+    }
+    const variance = varSum * invCols;
+    const invStd = 1 / Math.sqrt(variance + eps);
+    // normalize + scale + shift
+    for (let c = 0; c < cols; c++) {
+      y[off + c] = (x[off + c] - mean) * invStd * gamma[c] + beta[c];
+    }
+  }
+  return y;
+}
+
+/**
+ * GELU 活性化 (Gaussian Error Linear Unit)、tanh 近似版。
+ *
+ *   gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+ *
+ * PyTorch では `F.gelu(x, approximate="tanh")` がこの式と完全一致。
+ * 教材として精度より読みやすさを優先し tanh 近似を採用。必要なら erf 版に
+ * 切り替え可能 (未実装)。
+ */
+const GELU_COEF = Math.sqrt(2 / Math.PI);
+function gelu(x, out) {
+  const n = x.length;
+  const y = out ?? new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = x[i];
+    const inner = GELU_COEF * (v + 0.044715 * v * v * v);
+    y[i] = 0.5 * v * (1 + Math.tanh(inner));
+  }
+  return y;
+}
+
+// ─── ヘルパ ──────────────────────────────────────────────
+
+/**
+ * (rows, cols) の行列で (r, c) 番地を読む。
+ */
+function get2(A, cols, r, c) {
+  return A[r * cols + c];
+}
+
+/**
+ * (rows, cols) の行列で (r, c) 番地に書く。
+ */
+function set2(A, cols, r, c, v) {
+  A[r * cols + c] = v;
+}
+
+/**
+ * 行 r の view (Float64Array.subarray、コピーなし)。
+ */
+function row(A, cols, r) {
+  return A.subarray(r * cols, (r + 1) * cols);
+}
+
+/**
+ * 行列の転置 At = A^T。A: (M, N) → At: (N, M)
+ */
+function transpose(A, M, N, out) {
+  const At = out ?? new Float64Array(N * M);
+  for (let i = 0; i < M; i++) {
+    for (let j = 0; j < N; j++) {
+      At[j * M + i] = A[i * N + j];
+    }
+  }
+  return At;
+}
+
+/**
+ * 要素ごとの加算 A += B (in-place)。A と B は同じ長さ。
+ */
+function addInPlace(A, B, len) {
+  const n = len ?? A.length;
+  for (let i = 0; i < n; i++) A[i] += B[i];
+}
+
+/**
+ * 要素ごとのスカラー倍 A *= s (in-place)。
+ */
+function scaleInPlace(A, s, len) {
+  const n = len ?? A.length;
+  for (let i = 0; i < n; i++) A[i] *= s;
+}
+
+/**
+ * (M, N) の入れ子配列を flat Float64Array に変換。
+ * テスト fixture (JSON) からの読み込みに使う。
+ */
+function fromNestedArray(arr2d) {
+  const M = arr2d.length;
+  const N = M > 0 ? arr2d[0].length : 0;
+  const out = new Float64Array(M * N);
+  for (let i = 0; i < M; i++) {
+    for (let j = 0; j < N; j++) {
+      out[i * N + j] = arr2d[i][j];
+    }
+  }
+  return out;
+}
+
+/**
+ * flat Float64Array を (M, N) の入れ子配列に変換。
+ * テスト出力比較や JSON シリアライズに使う。
+ */
+function toNestedArray(flat, M, N) {
+  const out = new Array(M);
+  for (let i = 0; i < M; i++) {
+    const r = new Array(N);
+    for (let j = 0; j < N; j++) r[j] = flat[i * N + j];
+    out[i] = r;
+  }
+  return out;
+}
+
+
+// ---------- presets.js ----------
+
+// presets.js — デフォルト preset (japanese-mini-v1) を inline 化したもの。
+// 自動生成: tools/inline_preset.py が presets/japanese-mini-v1.json から書き出す。
+// 直接編集禁止 — preset を変えるときは presets/ 側を更新してから
+// `make inline-preset` を再実行すること。
+//
+// バンドル後の単一 HTML には起動時 fetch なしでこの preset が含まれる。
+// 追加 preset (induction-head, knowledge-lookup, random-init 等) は
+// 別ファイル (presets/*.json) のままで、UI から Import で読み込む想定。
+
+const DEFAULT_PRESET = {"name":"japanese-mini-v1","version":2,"kind":"hand-crafted","tier":2,"description":"Hand-crafted Tier 2 preset (Multi-Head Self-Attention + 残差 + LayerNorm + FFN, h=2, d_k=8, d_ff=32). 設計書 §6.9 の指針に従って構築 (学習はしていない)。 head 0 = adj→noun + pron→noun (修飾語族), head 1 = pred→noun (述語族), LN は γ=1, β=0 で標準化のみ, FFN は単 dim 検出器 (h0..h11) と AND 検出器 (h12..h15: 名詞 ∧ 各特徴) の knowledge memory 設計 を意図的に作り込んである。","config":{"T":5,"d_model":16,"h":2,"d_k":8,"d_ff":32,"N":1,"vocabSize":16,"vocab":["これ","それ","私","猫","花","本","小説","大きい","美しい","人気","読む","好き","は","が","を","です"]},"weights":{"W_E":[[0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3,0.0,0.0,0.0],[0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3,0.0,0.0],[0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3,0.0],[3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.3],[3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.3,0.0,0.0,0.0],[3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.3,0.0,0.0],[3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,0.0,0.0,0.3,0.0],[0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.3],[0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.3,0.0,0.0,0.0],[0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.3,0.0,0.0],[0.0,0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.3,0.0],[0.0,0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3],[0.0,0.0,0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,3.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.3]],"W_P":[[0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0],[0.8414709848078965,0.5403023058681398,0.31098359290718575,0.9504152802551828,0.09983341664682815,0.9950041652780258,0.03161750640243371,0.9995000416652778,0.009999833334166664,0.9999500004166653,0.0031622723897082473,0.9999950000041666,0.0009999998333333417,0.9999995000000417,0.0003162277607463752,0.9999999500000004],[0.9092974268256817,-0.4161468365471424,0.5911271172152932,0.8065784098850756,0.19866933079506122,0.9800665778412416,0.06320339793316936,0.9980006665777841,0.01999866669333308,0.9998000066665778,0.00632451315671895,0.9999800000666665,0.0019999986666669333,0.9999980000006666,0.0006324554898699746,0.9999998000000067],[0.1411200080598672,-0.9899924966004454,0.8126488966420368,0.5827536107022249,0.29552020666133955,0.955336489125606,0.09472609133274612,0.9955033739876628,0.02999550020249566,0.9995500337489875,0.00948669067865079,0.999955000337499,0.002999995500002025,0.999995500003375,0.0009486831557480254,0.9999995500000337],[-0.7568024953079282,-0.6536436208636119,0.9535807404869198,0.3011374625854739,0.3894183423086505,0.9210609940028851,0.12615406653456793,0.9920106609794029,0.03998933418663416,0.9992001066609779,0.012648773333754897,0.999920001066661,0.003999989333341867,0.9999920000106667,0.0012649107267577616,0.9999992000001067]],"blocks":[{"W_Q":[[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]],"W_K":[[1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]],"W_V":[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0]],"W_O":[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0]],"LN1_gamma":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"LN1_beta":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"FFN_W1":[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.6,0.6,0.6,0.6,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.6,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.6,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.6,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.6,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]],"FFN_b1":[-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-1.0,-0.5,-0.5,-0.5,-0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"FFN_W2":[[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]],"FFN_b2":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"LN2_gamma":[1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"LN2_beta":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}]},"designIntent":{"embeddingDims":{"0":"is_noun (猫, 花, 本, 小説 で 3.0)","1":"is_adjective (大きい, 美しい, 人気 で 3.0)","2":"is_pronoun (これ, それ, 私 で 3.0)","3":"is_predicate (読む, 好き で 3.0)","4":"is_は (は で 3.0)","5":"is_が (が で 3.0)","6":"is_を (を で 3.0)","7":"is_です (です で 3.0)","8":"美しさ特徴 (美しい, 花 で 1.0)","9":"サイズ特徴 (大きい, 猫 で 1.0)","10":"書物特徴 (本, 小説, 読む で 1.0)","11":"人気度特徴 (人気, 小説 で 1.0)","12":"識別痕跡 A (token id mod 4 == 0 のときに +0.3)","13":"識別痕跡 B (token id mod 4 == 1)","14":"識別痕跡 C (token id mod 4 == 2)","15":"識別痕跡 D (token id mod 4 == 3)"},"attentionBonds":{"0":"adjective Q → noun K (head 0)","1":"pronoun Q → noun K (head 0)","2":"predicate Q → noun K (head 1)"},"ffnNeurons":{"0":"名詞 dim (d0) 検出","1":"形容詞 dim (d1) 検出","2":"指示詞 dim (d2) 検出","3":"述語 dim (d3) 検出","4":"助詞「は」(d4) 検出","5":"助詞「が」(d5) 検出","6":"助詞「を」(d6) 検出","7":"コピュラ「です」(d7) 検出","8":"美しさ特徴 (d8) 検出","9":"サイズ特徴 (d9) 検出","10":"書物特徴 (d10) 検出","11":"人気度特徴 (d11) 検出","12":"AND: 名詞 ∧ 美しさ → 美しい名詞検出 (d8 を強化)","13":"AND: 名詞 ∧ サイズ → サイズを持つ名詞検出 (d9 を強化)","14":"AND: 名詞 ∧ 書物 → 書物検出 (d10 を強化)","15":"AND: 名詞 ∧ 人気度 → 人気な名詞検出 (d11 を強化)"},"scales":{"category_value":3.0,"feature_value":1.0,"trace_value":0.3,"attention_W":1.0,"sqrt_d_k":2.8284271247461903}}};
+
+
+// ---------- lessons.js ----------
+
+// lessons.js — Lesson 1〜Lesson 10 (Embedding〜FFN + 1 ブロック完成) の定義。
+// 設計書 §9 に対応。MLP 版 v1 の lessons.js と同じフォーマット
+// (id / title / hint / checks(3) + 補足) を採用。
+//
+// 略称 "T1" などはトークン位置 (T0..T4) と混同するので、Lesson 全体名は
+// 「Lesson 1」「Lesson 2」… のように省略せず書く。
+//
+// 各 Lesson は:
+//   sampleIdx : SAMPLE_SENTENCES のインデックス (0..7)
+//   viewTab   : 中央パネルでアクティブにするタブ ('embed' | 'qkv' | 'attn' | 'out')
+//
+// Lesson セレクタで選んだ瞬間に、controller.js が:
+//   1) Sample セレクタを sampleIdx に合わせる
+//   2) 中央タブを viewTab に切り替える
+//   3) 補助パネル「レッスン」タブに hint + checks を表示する
+//   4) Forward を自動で 1 回叩く (Lesson 1 / 2 は Embed プレビューだけで足りるので skip)
+
+/**
+ * @typedef {Object} Lesson
+ * @property {string} id          "Lesson 1" 〜 "Lesson 10"
+ * @property {string} title       UI 表示用
+ * @property {number} sampleIdx   SAMPLE_SENTENCES のインデックス
+ * @property {string} viewTab     "embed" | "qkv" | "attn" | "out"
+ * @property {boolean} runForward 選択時に自動で Forward するか
+ * @property {string} hint        1〜2 段落の目的文
+ * @property {string[]} checks    3 つの観察ポイント (任意で \n\n💡 補足: ... を付けて良い)
+ */
+
+const LESSONS = Object.freeze([
+  {
+    id: "Lesson 1",
+    title: "Lesson 1. Token Embedding を見る",
+    sampleIdx: 0,             // これ は 美しい 花 です
+    viewTab: "embed",
+    runForward: false,        // Lesson 1 は X (= 埋め込み + 位置エンコーディング) だけ見れば十分
+    hint:
+      "Transformer の最初の段階: 各 token を 16 個の数値の並び (= ベクトル) に変換する。" +
+      "本シミュレータではこの 16 個の **列方向のインデックス** を「dim」(dimension の略) と呼ぶ。" +
+      "dim 0、dim 1、…、dim 15 のように呼ぶときは概念として、" +
+      "画面の列ヘッダや数式中で位置を指す場合は省略形の「d0」「d1」… を使う " +
+      "(「dim 1」と「d1」は同じ列を指す別表記)。\n" +
+      "\n" +
+      "**hand-crafted preset の dim 設計 (全 16 dim)**\n" +
+      "1 次カテゴリ (強度 +3.0、その token がそのカテゴリに属するときのみ +3.0、それ以外は 0):\n" +
+      "  d0 = 名詞 dim     (猫=3, 花=4, 本=5, 小説=6)\n" +
+      "  d1 = 形容詞 dim   (大きい=7, 美しい=8, 人気=9)\n" +
+      "  d2 = 指示詞 dim   (これ=0, それ=1, 私=2)\n" +
+      "  d3 = 述語 dim     (読む=10, 好き=11)\n" +
+      "  d4 = is_は (は=12)、d5 = is_が (が=13)、d6 = is_を (を=14)、d7 = is_です (です=15)\n" +
+      "2 次特徴 (強度 +1.0、複数 token に共通する意味属性):\n" +
+      "  d8 = 美しさ特徴   (美しい=8, 花=4)\n" +
+      "  d9 = サイズ特徴   (大きい=7, 猫=3)\n" +
+      "  d10 = 書物特徴   (本=5, 小説=6, 読む=10)\n" +
+      "  d11 = 人気度特徴  (人気=9, 小説=6)\n" +
+      "識別痕跡 (強度 +0.3、token id を区別するための微小な差):\n" +
+      "  d12〜d15 のうち token_id mod 4 で決まる 1 つに +0.3 を加える\n" +
+      "\n" +
+      "**中央タブ「Embed」の 3 行列**\n" +
+      "  W_E[tokens] (上段): token 埋め込み (位置と無関係に token の意味だけ、上記設計値)\n" +
+      "  W_P         (中段): 位置エンコーディング (token と無関係、位置 t=0..4 で sin/cos)\n" +
+      "  X = W_E + W_P (下段): 上 2 つの和、Q/K/V 計算の入力\n" +
+      "\n" +
+      "**Lesson 1 では W_E に集中する**\n" +
+      "X = W_E + W_P には PE 値 (~±1) が常に上乗せされており、純粋な token 意味だけを見たい場面では混乱しやすい。" +
+      "そこで Lesson 1 の観察ポイントでは **W_E[tokens] の行列** (Embed タブ最上段) を見る。値は preset 設計値そのままで PE が混じらないので、+3.0 / +1.0 / +0.3 / 0 の意図がそのまま読み取れる。" +
+      "W_P と X の役割は Lesson 2 以降で扱う。",
+    checks: [
+      "**Embed タブ最上段の W_E[tokens] 行列**で T2「美しい」の行を見る。d1 = +3.000 (形容詞 dim)、d8 = +1.000 (美しさ特徴)、d12〜d15 のうち id=8 mod 4 = 0 なので d12 = +0.300、それ以外の dim はすべて 0.000。「美しい」は形容詞かつ美しさ特徴を持つ、という設計値がそのまま見える。セル W_E[id=8 美しい, d1] をクリックすると、これが preset の hand-crafted 値であり位置 t に依存しないことが「式の展開」に出る。",
+      "**W_E[tokens] 行列**で T3「花」の行を見る。d0 = +3.000 (名詞 dim)、d8 = +1.000 (美しさ特徴)、d12〜d15 のうち id=4 mod 4 = 0 なので d12 = +0.300、それ以外は 0.000。「花」も「美しさ特徴」を持つので、「美しい」と「花」は d8 で意味的に近い (どちらも +1.000)。これは hand-crafted で意図的に作ってある (= preset を作る人の主観で「花は美しい」を入れた、と言える)。",
+      "**W_E[tokens] 行列**で T0「これ」の行を見る。d2 = +3.000 (指示詞 dim)、d12〜d15 のうち id=0 mod 4 = 0 なので d12 = +0.300、それ以外は 0.000。指示詞は「名詞でも形容詞でも述語でもない、独立カテゴリ」として 1 つの dim を占有している。\n\n💡 補足 (X 行列との違い): 同じ T0「これ」の行を **下段の X 行列** で見ると、d2 = +3.000 だけでなく d1 = +1.000、d3 = +1.000、d5 = +1.000 などにも値が入っている。これらは W_E では 0 だが、W_P (中段) の cos(0) = 1 という値が乗ってきたもの。X = W_E + W_P なので「token の意味」と「位置の指紋」が混ざる。Lesson 2 でその仕組みを掘り下げる。",
+    ],
+  },
+  {
+    id: "Lesson 2",
+    title: "Lesson 2. Positional Encoding を見る",
+    sampleIdx: 0,
+    viewTab: "embed",
+    runForward: false,
+    hint:
+      "Transformer は token の並び順そのものを直接扱う仕組みを持たない " +
+      "(= 行列演算は token の並び順を入れ替えても結果が同じになる)。" +
+      "そこで各位置 t に対して固定の「位置の指紋」を埋め込みに加えることで、" +
+      "「同じ token でも位置が違えば違うベクトル」になるようにする。これを **位置エンコーディング** と呼び、" +
+      "本シミュレータの行列名では W_P で表す。\n\n" +
+      "本シミュレータは Transformer 元論文方式の固定 (= 学習しない) 位置エンコーディングを使う:\n" +
+      "  偶数 dim (d0, d2, d4, …):  W_P[t, 2i]   = sin(t / 10000^(2i/d_model))\n" +
+      "  奇数 dim (d1, d3, d5, …):  W_P[t, 2i+1] = cos(t / 10000^(2i/d_model))\n" +
+      "ここで t は位置 (0..4)、i は「半分の dim 番号」(d0/d1 のペアなら i=0、d2/d3 のペアなら i=1、…)。" +
+      "10000 のべき乗は dim が大きいほど大きい数になり、結果として高 dim の sin/cos は周期が長くなる (位置の変化に鈍感)。" +
+      "この同時表示の sin/cos と多周期の重ね合わせにより、各位置 t に「他の位置とは違う固有のベクトル」が割り当てられる。\n\n" +
+      "Embed タブには 3 つの行列が縦に並んで表示される:\n" +
+      "  (1) W_E[tokens] — token 埋め込み (位置と無関係)\n" +
+      "  (2) W_P         — 位置エンコーディング (token と無関係)\n" +
+      "  (3) X = W_E + W_P — 上 2 つの和。これが Q/K/V 計算の入力になる",
+    checks: [
+      "Embed タブで W_P (中段の行列) を見る。pos 0 の行は d0=sin(0)=0、d1=cos(0)=1、d2=sin(0)=0、d3=cos(0)=1、… と sin/cos 交互の規則的なパターン。pos 1 の行は d0=sin(1)≈0.841、d1=cos(1)≈0.540、… と異なる「指紋」になっている。W_P[pos 0, d1] のセルをクリックすると、cos(0 / 10000⁰) = cos(0) = 1 の数値展開が「式の展開」タブに出る。",
+      "Embed タブの上段「W_E[tokens]」と中段「W_P」は完全に独立。Sample セレクタで「私 は 猫 が 好き」(#3) に切り替えると上段は変わるが、中段 W_P は **完全に同じ** (位置エンコーディングは位置だけで決まる固定値だから)。\n\n💡 補足: これが「同じ位置に同じ token があれば必ず同じ X になる、位置が違えば X も違う」という Transformer の前提を作っている。例えば「私 は 本 を 読む」(#4) と「私 は 小説 を 読む」(#5) は T0「私」、T1「は」、T3「を」、T4「読む」が共通で、X の対応する行も完全一致する。",
+      "右側の dim (例: d14, d15) を見ると、pos 0..4 の値がほぼ同じに見える。これは 10000^(2i/d_model) の値が高 dim ほど大きくなり (例: i=7 なら 10000^(14/16) ≈ 5623)、t / その値 がほぼ 0 に張り付いて sin/cos の値もほぼ一定になるため。逆に d0/d1 のような低 dim では 10000⁰ = 1 で割るので、sin(0)..sin(4) が −0.76..0.91 と大きく動く。これが「位置エンコーディングは dim 軸方向に異なる周波数を重ね合わせている」という性質。\n\n💡 補足: 元論文ではこの周波数階層により「位置の差」を線形変換だけで取り出せる、と論じている (W_P[t+k] が W_P[t] の線形変換で近似できる)。本シミュレータで深く検証はしないが、低 dim ほど位置に敏感、高 dim ほど位置に鈍感、という傾向は数値で見て取れる。",
+    ],
+  },
+  {
+    id: "Lesson 3",
+    title: "Lesson 3. Q (Query) projection を見る",
+    sampleIdx: 0,
+    viewTab: "qkv",
+    runForward: true,
+    hint:
+      "同じ入力 X から、3 つの異なる射影 Q, K, V を作る。それぞれ W_Q, W_K, W_V との行列積:\n" +
+      "  Q = X · W_Q (Query): 各 token が「どんな相手を見たいか」の問い合わせ\n" +
+      "  K = X · W_K (Key):   各 token が「自分はこう参照される」と差し出すラベル\n" +
+      "  V = X · W_V (Value): 各 token が「もし注目されたら自分はこの情報を渡す」という中身\n" +
+      "Lesson 3 では Q を、Lesson 4 で K を、Lesson 5 で V を、それぞれ独立に観察する。\n" +
+      "\n" +
+      "**Multi-Head 構造**\n" +
+      "本シミュレータは h=2 head、d_k=8 (= d_model/h)。Q の出力空間 16 dim を前半 8 dim (head 0) と後半 8 dim (head 1) に分け、後段の attention 計算では各 head が独立に動く。" +
+      "重み行列 W_Q は shape (d_model=16) × (h*d_k=16)。col 0..7 が head 0 用、col 8..15 が head 1 用。" +
+      "中央タブ「Q-K-V」では W_Q を 1 つ、その下に Q[head 0] と Q[head 1] を縦に並べて表示する (K, V も同様)。列ヘッダ「h0.d0」は「head 0 の d0」、「h1.d0」は「head 1 の d0 (= global col 8)」を表す。\n" +
+      "\n" +
+      "**bond (= ボンド) とは**\n" +
+      "Q と K の出力 dim のうち、preset で「特定の文法関係を運ぶレーン」として使うものを bond と呼ぶ。本 preset の bond 配置:\n" +
+      "  bond 0 (head 0 の d0 = global col 0): Q が形容詞、K が名詞 のときに揃うレーン\n" +
+      "  bond 1 (head 0 の d1 = global col 1): Q が指示詞、K が名詞 のときに揃うレーン\n" +
+      "  bond 2 (head 1 の d0 = global col 8): Q が述語、  K が名詞 のときに揃うレーン\n" +
+      "つまり head 0 が修飾語族 (形容詞・指示詞)、head 1 が述語族 (述語) を担当する分業設計。残りの col は preset で 0 のまま。\n" +
+      "\n" +
+      "**Lesson 3 で観察する W_Q の役割**\n" +
+      "W_Q は「入力 dim X[t, d_in] のうちどれを bond の col に流すか」を決める重み。" +
+      "たとえば W_Q[d1, g=0] = 1 は「入力 dim 1 (= 形容詞 dim) を head 0 の col 0 (= bond 0) に流す」。" +
+      "形容詞 token は W_E で d1 = +3 が立っているので、W_Q を経由して Q[t, h0.d0] に +3 付近が出る。これが形容詞 token の「bond 0 で問い合わせをかける」状態。\n" +
+      "\n" +
+      "**位置エンコーディングの混入について**\n" +
+      "Q = X · W_Q の入力 X = W_E + W_P には、Lesson 2 で見た位置エンコーディング (W_P) の sin/cos 値 (~±1) が常に乗っている。" +
+      "preset で配線が立っている dim には「形容詞である」「述語である」といった文法カテゴリの値だけでなく、**同じ dim に乗っている位置エンコーディングの値も同じ係数で Q に流れ込む**。" +
+      "結果として、形容詞ではない token の Q にも、位置エンコーディング由来の小さな値 (~±1) が紛れ込む。これを以降「**位置エンコーディングの混入**」と呼ぶ (本物の bond 信号ではない)。",
+    checks: [
+      "**W_Q 行列**の非ゼロ位置を確認する。3 つだけ非ゼロで、それ以外はすべて 0:\n  W_Q[d1, h0.d0] = +1.000 (bond 0: 形容詞 dim → head 0 col 0)\n  W_Q[d2, h0.d1] = +1.000 (bond 1: 指示詞 dim → head 0 col 1)\n  W_Q[d3, h1.d0] = +1.000 (bond 2: 述語 dim → head 1 col 0 = global col 8)\nそれ以外の入力 dim (名詞 d0、助詞 d4..d7、特徴 d8..d11、識別痕跡 d12..d15) は W_Q では 0 — つまり「これらのカテゴリの token は Query をどの bond にも流さない (= 自分から相手を探しに行かない)」設計。セル W_Q[d1, h0.d0] をクリックすると bond 0 (形容詞 → 名詞) の解釈が表示される。",
+      "**Q 行列 [head 0]** の T2「美しい」(形容詞) の行を見る。d0 = +2.584 が支配的、d1 = +0.591、d2..d7 = 0.000。\n  d0 (= bond 0) の +2.584 は W_Q[d1, h0.d0] = 1 を経由して X[T2, d1] = +2.584 (形容詞 dim の +3 + 位置エンコーディング cos(2) ≈ -0.42) が流れ込んだもの。**これが「形容詞である自分が、bond 0 で名詞 K を探しに行く」状態の数値表現**。\n  d1 (= bond 1) の +0.591 は W_Q[d2, h0.d1] = 1 を経由して X[T2, d2] = +0.591 (指示詞 dim の 0 + 位置エンコーディング sin(2/10000^(2/16))) が流れ込んだ **位置エンコーディングの混入**。「美しい」は指示詞ではないので bond 1 で問い合わせる意図はないが、たまたま指示詞 dim の位置に乗っていた位置エンコーディングの値が同じ配線を通って漏れ込む。\n  d2..d7 が 0 なのは W_Q がそれらの col に何も配線していないため。\n\n💡 解釈: head 0 では bond 0 が +2.584、bond 1 が +0.591 と「本物の bond 0 信号 (+2.584) ≫ 位置エンコーディングの混入 (+0.591)」になっており、形容詞らしい Query がきちんと立っている。",
+      "**Q 行列 [head 1]** の T2「美しい」の行を見る。d0 = +0.807、d1..d7 = 0.000。\n  d0 (= bond 2) の +0.807 は W_Q[d3, h1.d0] = 1 を経由して X[T2, d3] = +0.807 (述語 dim の 0 + 位置エンコーディング cos(2/10000^(2/16)) ≈ +0.807) が流れ込んだもの。「美しい」は述語ではないので **本物の bond 2 信号ではなく、位置エンコーディングの混入だけ**。\n\n💡 解釈: head 1 全体が位置エンコーディング由来の +0.807 程度の弱い反応しか出していない。「美しい」は head 1 (述語族レーン) では何も問い合わせていない、ということ。Lesson 6 でこれと K の名詞信号 (+3.14) の内積を取ると score ~+1 程度の中程度の値になり、softmax 後は緩い分布になる (Lesson 7 で観察)。\n\n💡 補足 (他 token の Q を見比べる):\n  T0「これ」(指示詞) の Q[head 0] では d1 = +3.000 が支配的、d0 = +1.000 (位置エンコーディングの混入)、d2..d7 = 0。**これが「指示詞である自分が、bond 1 で名詞 K を探しに行く」状態**。サンプル #1 には述語 token が無いので、本物の bond 2 が立つ Q は出ない。\n  サンプル #3「私 は 猫 が 好き」に切り替えると T4「好き」(述語) の Q[head 1] で d0 = +3.000 (述語 dim の +3) が立つ — **これが「述語である自分が、bond 2 で名詞 K を探しに行く」状態**。Lesson 8 で 3 種類すべての bond が立つ様子を観察する。",
+    ],
+  },
+  {
+    id: "Lesson 4",
+    title: "Lesson 4. K (Key) projection を見る",
+    sampleIdx: 0,
+    viewTab: "qkv",
+    runForward: true,
+    hint:
+      "Lesson 3 で Q を見た。今回は K (Key) を観察する。K = X · W_K で、各 token の「自分はこういう種類の相手として参照される」というラベルを作る。\n" +
+      "\n" +
+      "**Q と K の役割の非対称性**\n" +
+      "Q 側は「自分が何者か (形容詞 / 指示詞 / 述語)」によって 1 本の bond だけに信号を流すが、K 側は preset で **名詞 dim だけが 3 本の bond すべてに流す** ように配線されている。" +
+      "つまり「全方位から参照される名詞」「特定方向だけ問い合わせる修飾語」という非対称な関係を、W_K の hand-crafted で実現している。\n" +
+      "\n" +
+      "**W_K の配線 (3 つだけ非ゼロ)**\n" +
+      "  W_K[d0, h0.d0] = 1 (名詞 dim → bond 0 (形容詞 → 名詞) の K 側)\n" +
+      "  W_K[d0, h0.d1] = 1 (名詞 dim → bond 1 (指示詞 → 名詞) の K 側)\n" +
+      "  W_K[d0, h1.d0] = 1 (名詞 dim → bond 2 (述語 → 名詞) の K 側)\n" +
+      "**1 つの入力 dim (d0 = 名詞 dim) が 3 つの bond col すべてに +1 で流れる**。これは W_Q とは違う非対称な構造で、入力 dim 行を見ると 3 つの非ゼロが一直線に並ぶ。\n" +
+      "\n" +
+      "**位置エンコーディングの混入は Q 側より弱い**\n" +
+      "Lesson 3 で「位置エンコーディングが配線を通って Q に紛れ込む」現象を見たが、K 側でも同じことが起こる。" +
+      "ただし W_K は **1 つの入力 dim (= d0 = 名詞 dim) だけ** しか参照しないので、混入する経路は 1 本だけ。" +
+      "さらに t=0 の位置エンコーディングは d0 = sin(0) = 0 なので、T0 token の K では混入も完全にゼロ。" +
+      "T=1 以降では X[t, d0] = sin(t) の小さな値 (~±1) が同じ配線を通って 3 本の bond col すべてに同じ値で漏れる。",
+    checks: [
+      "**W_K 行列**の d0 (= 名詞 dim) の行を見る。h0.d0, h0.d1, h1.d0 (= global col 0, 1, 8) が +1.000、その他 13 個の col は 0.000。「名詞という入力カテゴリ 1 つが 3 つの bond すべてに流れる」設計が、行ごと水平に並んだ +1.000 として可視化される。それ以外の行 (d1..d15) は **すべて 0** — 形容詞・指示詞・述語など他カテゴリの token が K 側で bond に信号を出さない設計。\n\n💡 解釈: 名詞は「形容詞からも、指示詞からも、述語からも参照される」3 本立ての受信機。形容詞・指示詞・述語などは「Query を発する側」専門で、Key としては bond には現れない。",
+      "**K 行列 [head 0]** の T3「花」(名詞) の行を見る。d0 = +3.141、d1 = +3.141、d2..d7 = 0.000。\n  d0 (= bond 0) も d1 (= bond 1) も同じ +3.141 — これは X[T3, d0] = +3.141 (名詞 dim の +3 + 位置エンコーディング sin(3) ≈ +0.141) という同じ値が、W_K[d0, h0.d0] = 1 と W_K[d0, h0.d1] = 1 の 2 経路に流れ込んだ結果。\n\n💡 解釈: 「花」の K head 0 は **bond 0 と bond 1 で同じ +3.141 が立つ**ため、形容詞 Query (bond 0 が立つ) からも指示詞 Query (bond 1 が立つ) からも内積を取ると同じ寄与 +3.141 を返す。**これが「名詞である自分が、修飾語からも指示詞からも全方位で参照される受信機」状態の数値表現**。",
+      "**K 行列 [head 1]** の T3「花」の行を見る。d0 = +3.141、d1..d7 = 0.000。\n  d0 (= bond 2) の +3.141 は同じく X[T3, d0] が W_K[d0, h1.d0] = 1 を経由して流れた値。head 0 と head 1 で値は完全一致 (+3.141)。これにより「花」は head 1 の bond 2 (述語 Query) からも参照され得る。\n\n💡 解釈: 名詞 1 つの K 信号が 3 本の bond すべてに完璧に行き渡っている。head 1 の +3.141 は **「名詞である自分が、述語からも参照される」状態**。\n\n💡 補足 (非名詞 token の K): K [head 0] の T0「これ」 (指示詞) 行は **すべて 0**。これは X[T0, d0] = 0 (名詞 dim = 0) かつ W_P[0, 0] = sin(0) = 0 で、位置エンコーディングの混入すらも完全にゼロになるため。一方 T1「は」 (助詞) 行は d0 = d1 = +0.841 (= 位置エンコーディング sin(1) が混入)。Lesson 6 で見るように、scores の T0 列がすべて 0 になるのはこの「K[T0] が完全に 0」が原因。",
+    ],
+  },
+  {
+    id: "Lesson 5",
+    title: "Lesson 5. V (Value) projection を見る",
+    sampleIdx: 0,
+    viewTab: "qkv",
+    runForward: true,
+    hint:
+      "Lesson 3 で Q、Lesson 4 で K を見た。最後に V (Value) を観察する。V = X · W_V で、各 token が「自分が attention で参照されたら、どんな情報を渡すか」を表す。\n" +
+      "\n" +
+      "**本 preset の W_V は単位行列**\n" +
+      "Lesson 3/4 で見た W_Q / W_K は「3 つの bond に流す配線だけ + 他は 0」という極端なスパース行列だった。" +
+      "一方 W_V は **対角線がすべて +1.000 の単位行列 (identity)**。" +
+      "これは hand-crafted で「Value は X をそのまま通す」という選択をしているため。" +
+      "つまり V_full = X · I = X となり、入力埋め込みがそのまま V として後段に渡る。\n" +
+      "\n" +
+      "**なぜ identity にするのか (教育的選択)**\n" +
+      "本シミュレータは attention の構造を観察するための教材なので、attentionOut (= attn · V) を見たときに「注目した token の埋め込みを集めただけ」と素直に解釈できるようにしてある。" +
+      "実 Transformer では W_V も学習で意味のある射影になる (例: 「形容詞情報を取り出して名詞に届ける」など)。本 preset は教育的に identity を維持。\n" +
+      "\n" +
+      "**Multi-Head における V の dim 分配**\n" +
+      "V_full が X と完全一致すると、Multi-Head では:\n" +
+      "  V[head 0] = X[:, 0..7]  (各 token のカテゴリ系 dim: 名詞・形容詞・指示詞・述語・助詞 4 種)\n" +
+      "  V[head 1] = X[:, 8..15] (各 token の特徴系 dim: 美しさ・サイズ・書物・人気度 + 識別痕跡 + 位置エンコーディングの高 dim)\n" +
+      "つまり **head 0 は token の文法カテゴリ情報を、head 1 は意味特徴情報を運ぶ V** になる。後段の attentionOut もこれに従って head ごとに違う種類の情報を集約する。",
+    checks: [
+      "**W_V 行列**を全体的に眺める。対角線 (W_V[d, d] = +1.000、d = 0..15) だけが非ゼロで、他はすべて 0。これが単位行列 (identity)。Embed タブで見た W_E や W_Q / W_K のような hand-crafted な「特定の dim だけ」の構造ではなく、「全 dim をそのままコピー」する素朴な対角行列。セル W_V[d0, h0.d0] をクリックすると単位行列であることの解釈が表示される。\n\n💡 解釈: W_V が identity ということは「**どの token も自分の埋め込み X をそのまま V として差し出す**」状態。実 Transformer では学習で「注目された側が何を渡すかを選ぶ」ようになるが、本シミュレータでは「全部そのまま渡す」素朴な設計に固定して、attention の集約過程だけを純粋に観察できるようにしてある。",
+      "**V 行列 [head 0]** の T3「花」の行を見る。d0 = +3.141、d1 = -0.990、d2 = +0.813、d3 = +0.583、d4 = +0.296、d5 = +0.955、d6 = +0.095、d7 = +0.996。これらの値は **そのまま X[T3, 0..7] と同じ**。W_V が identity なので head 0 は「X の前半 8 dim をコピーしただけ」。\n  特に d0 = +3.141 は名詞 dim (+3) + 位置エンコーディング sin(3) ≈ +0.141。d1〜d7 は形容詞・指示詞・述語・助詞 dim で、「花」は名詞なのでそれらの W_E は 0 だが、位置エンコーディングの値だけが乗っている。\n\n💡 解釈: head 0 が attention で運ぶ V は **「注目された token の文法カテゴリ情報」**。例えば形容詞 Query (T2 美しい) が名詞 K (T3 花) を強く参照すれば、attentionOut[T2, head 0] には「花が名詞である」という情報が混ざる。**これが「自分が参照されたら、自分の文法カテゴリ情報を相手に渡す」状態の数値表現**。",
+      "**V 行列 [head 1]** の T3「花」の行を見る。d0 = +1.030 (= X[T3, d8] = 美しさ特徴 +1 + 位置エンコーディングの微小値)、d1 = +1.000 (= X[T3, d9] = サイズ特徴 0 + 位置エンコーディング cos(3/10000^(8/16)) ≈ +1)、d2 = +0.009 (= X[T3, d10] = 書物特徴 0 + 位置エンコーディングの微小値)、d3 = +1.000 (= X[T3, d11] = 人気度 0 + 位置エンコーディング cos)、d4 = +0.303 (= X[T3, d12] = 識別痕跡 +0.3 + 位置エンコーディングの微小値)、d5 = +1.000、d6 = +0.001、d7 = +1.000。\n\n💡 解釈: head 1 が運ぶ V は **「注目された token の意味特徴情報 (美しさ・サイズ・書物・人気度) と識別痕跡」**。「花」の場合は美しさ特徴 +1.0 が head 1 の d0 に乗る。形容詞 Query が花を参照すれば head 1 には「美しさ +1」が伝わる。**これが「自分が参照されたら、自分の意味特徴情報を相手に渡す」状態の数値表現**。\n\n💡 補足 (head 1 の奇数 dim がほぼ +1 になる件): head 1 を眺めると d1, d3, d5, d7 がどれも ≈ +1.000 で並んで見える。これは **位置エンコーディングの周波数階層** (Lesson 2) の効果。head 1 の global dim は d8..d15 で、奇数 dim (= d9, d11, d13, d15) は cos を使い、しかも分母 10000^(2i/d_model) が大きいため cos(0 に近い値) ≈ 1.000 がほぼ一定で乗る。このため奇数 dim はどの token でも ≈ +1 になり、token を区別する情報はほぼ持たない (= 共通の baseline)。逆に **head 1 で token を区別する情報を持つのは偶数 dim** (d0=美しさ, d2=書物, d4=識別痕跡 A, d6=識別痕跡 C)。これらは sin(0 に近い値) ≈ 0 なので W_E の特徴値がそのまま透けて見える。「花」の場合は d0 に +1.0 (美しさ)、d4 に +0.3 (識別痕跡 A) が立つのが本物の情報、奇数 dim の +1.0 は背景パターン、と読み分けるとよい。\n\n💡 補足 (head 0 では差がはっきり見える件): head 0 の global dim は d0..d7 で、低 dim ほど位置エンコーディングの周期が短く (d0/d1 では周期 2π)、token によって sin/cos の値が大きくばらつく。さらに d0..d3 にはカテゴリ dim (名詞・形容詞・指示詞・述語) が +3 で乗るので、token ごとに大きく異なる値が並ぶ — これが head 0 で「相対差がはっきり見える」理由。head 1 は意味特徴 +1 と位置エンコーディングの定常成分 ≈ 1 が同じ大きさなので、見た目の差が小さくなる。\n\n💡 補足 (V のシンプルさを利用): W_V が identity なので、Lesson 6 以降の attnOut 観察で「attn の重みで X[各 token, head の dim 範囲] を加重平均しただけ」と読めば良い。これは hand-crafted の教材としての透明性 — 実 Transformer の学習済み W_V だと「どの dim を取り出すか」も学習で決まるため、各 head の V の意味は経験的にしか理解できない。",
+    ],
+  },
+  {
+    id: "Lesson 6",
+    title: "Lesson 6. Attention Score (Q·K^T)",
+    sampleIdx: 0,
+    viewTab: "attn",
+    runForward: true,
+    hint:
+      "scores[hi, i, j] = (Q[i, hi, :] · K[j, hi, :]) / √d_k。Q と K の内積を √d_k (= √8 ≈ 2.828) で割って「head hi で i から j への注目強度の生スコア」を計算する。" +
+      "Multi-Head なので **head ごとに独立に scores 行列が 1 つ作られる** (h=2 → scores の shape は (h, T, T))。\n" +
+      "\n" +
+      "**bond 配置 (Lesson 3〜5 の復習)**\n" +
+      "  head 0: bond 0 (形容詞 → 名詞) と bond 1 (指示詞 → 名詞) を担当 → 修飾語族 attention\n" +
+      "  head 1: bond 2 (述語 → 名詞) を担当 → 述語族 attention\n" +
+      "サンプル #1「これ は 美しい 花 です」では head 0 で 2 種類 (形容詞 → 名詞、指示詞 → 名詞) が立つ。head 1 は preset 配線が「述語 → 名詞」だが「です」の述語 dim = 0 のためほぼ位置エンコーディングの混入だけが効く。\n" +
+      "\n" +
+      "**ただし位置エンコーディングが混じる**\n" +
+      "Q = X · W_Q の入力 X = W_E + W_P には Lesson 2 で見た位置エンコーディング (W_P) の sin/cos (~±1) が常に乗っている。preset で配線が立っている dim には形容詞 dim 等の文法カテゴリ値だけでなく **W_P 値も同じ係数で Q に流れる**。" +
+      "結果、形容詞でない token (例: 「は」) の Q にも位置エンコーディング由来の小さな値が紛れ込み、K[名詞] の +3.14 と内積を取ると score ~+1 が出る。scores は「target bond の信号 (大) + 位置エンコーディングの混入による共鳴 (中)」の合算で、純粋な 0 にはなりにくい。\n" +
+      "\n" +
+      "**scores のセルをクリックすると**\n" +
+      "「式の展開」タブに、その head の Q[i, hi] と K[j, hi] のうち 0 でない dim だけを抜き出した抜粋表が出る。黄色行が各 dim ごとの Q · K の積で、その総和を √d_k = √8 で割ったものが scores セル値。",
+    checks: [
+      "**scores 行列 [head 0]** の T2「美しい」の行を見る。T3「花」の列が +3.526 と最大、他列は -0.850 〜 +1.021 の範囲に分布。セル scores[h0, T2 美しい, T3 花] をクリックすると関連 dim 抜粋表が出る: head 0 col 0: Q=+2.584 × K=+3.141 = +8.116 (bond 0 本筋)、col 1: +0.591 × +3.141 = +1.857 (位置エンコーディングの混入 × 名詞 K)。col 2..7 はゼロ。総和 +9.973 を √8 = 2.828 で割って +3.526。",
+      "**scores 行列 [head 0]** の T0「これ」(指示詞) の行も同様に T3「花」が最大 (+4.442)、Q[T0, h0.d1] が指示詞 dim + 位置エンコーディングで立ち bond 1 が支配的。ただし他列もフラットな 0 ではない。T1「は」列が +1.190、T2「美しい」列が +1.286、T4「です」列が -1.070 のように、位置エンコーディングの混入で -1.070 〜 +1.286 の中程度の値が散らばる。「target が一番大きい」が、「他がぴったり 0」ではない点に注意。\n\n💡 補足: T3「花」(名詞) の行は -0.197 〜 +0.047 とほぼ 0 に張り付く (T3「花」自身の列が -0.197、他列の最大は T4「です」列の +0.047)。W_Q[d0, *] = 0 で Q[T3] が位置エンコーディングの混入だけだから。本シミュレータで本当に「ほぼ 0 のフラットな行」になるのは名詞の行 (= Query を発しない側)。",
+      "**scores 行列 [head 1]** を見る。サンプル #1 のどの query 行も、T3「花」列が最大で +0.334 〜 +1.111 の範囲、他列は -0.268 〜 +0.321 で似たような分布。例えば T0「これ」の行は [0.000, +0.298, +0.321, +1.111, -0.268]、T2「美しい」の行は [0.000, +0.240, +0.259, +0.896, -0.216]。これは「Q[*, h1.d0] = 各 token の位置エンコーディング (d3) の値、K[T3 花, h1.d0] = +3.14 (名詞 dim) の内積」が出ているもの。\n\n💡 解釈: head 1 は preset で「述語 dim → bond 2」と配線してあるが、サンプル #1 では Q 側に述語 dim (= d3) が +3 で立つ token がない (本 preset では d3 に +3 が立つのは「読む」「好き」のみ。「美しい」は形容詞 dim、「です」は助詞・コピュラ系 dim にしか値を持たない狭義の定義)。よって Q[T0..T4, h1.d0] は位置エンコーディングの混入だけ、K[T3 花, h1.d0] = +3.14 (名詞 dim) は名詞ゆえ大きい、という非対称な内積になり、どの query も同じ K[T3 花] に向かって緩く反応するだけになる。\n\n💡 補足 (サンプル #3 で本物の bond 2 を確認): Sample セレクタを #3「私 は 猫 が 好き」に切り替えると、T4「好き」が「述語 dim = +3」を持つので Q[T4, h1.d0] に +3 付近が立つ。これと K[T2 猫] (名詞 dim) が内積を取って head 1 で本物の bond 2 が立つ様子は Lesson 7 の補足で確認できる。",
+    ],
+  },
+  {
+    id: "Lesson 7",
+    title: "Lesson 7. softmax と attention map",
+    sampleIdx: 0,             // Lesson 6 と同じ「これ は 美しい 花 です」で接続
+    viewTab: "attn",
+    runForward: true,
+    hint:
+      "Lesson 6 で見た scores 行列 (head 別) を、行ごとに softmax して確率分布 (各行の和 = 1) にする。これが attn 行列。Multi-Head なので head 0 と head 1 で **独立に softmax** がかかる (shape は (h, T, T))。\n" +
+      "\n" +
+      "**softmax の効き方**\n" +
+      "softmax(x) = exp(x) / Σ exp(x') は行内の相対差で集中度が決まる。Lesson 6 で見たように head 0 の scores は最大 +4.4、head 1 は最大 +1.1 と head によって差が違う。" +
+      "exp は非線形で、最大とその他の差が +3 を超えると 20 倍以上に増幅される (鋭い集中)。差が +1 程度だと softmax 後は 3 倍程度しか開かず、緩い集中になる。\n" +
+      "\n" +
+      "**サンプル #1 で見える bond と見えない bond**\n" +
+      "「これ は 美しい 花 です」では:\n" +
+      "  head 0: bond 0 (形容詞 → 名詞: T2 美しい→T3 花) と bond 1 (指示詞 → 名詞: T0 これ→T3 花) が両方立つ。鋭い集中。\n" +
+      "  head 1: 述語 token がない (「です」の述語 dim = 0) ので、位置エンコーディングの混入だけの diffuse な分布。\n" +
+      "bond 2 (述語 → 名詞) を観察するには task 3 補足で Sample を **#3 (私 は 猫 が 好き)** に切り替えて T4「好き」の行を head 1 で見る。",
+    checks: [
+      "**attn 行列 [head 0]** の T0「これ」(指示詞) の行を見る。T3「花」のセルが ≈ 0.912 と支配的、他列は 0.004 〜 0.039。Lesson 6 の scores [head 0] T0 の行では T3 が +4.442 で他列 (0.000 〜 +1.286) との差が最大 ~4.4 だったのが、softmax で exp 増幅されて 1 ヶ所集中になっている。これは bond 1 (head 0 の d1、指示詞 → 名詞) が「これ」(Q) と「花」(K) で揃って scores が立った帰結。",
+      "**attn 行列 [head 0]** の T2「美しい」の行を見る。T3「花」が ≈ 0.834 で同じく支配的だが、T0「これ」より少し緩い (T1「は」が 0.063、T2 自身が 0.068 と少し残る)。Lesson 6 の scores [head 0] で T3 が +3.526 と T0 の行より小さく、最大と他列の差が少し縮まったため。bond 0 (形容詞 → 名詞) は立っているが、scores の絶対差が softmax 後の鋭さを決めることが見て取れる。\n\n💡 補足: T0 (scores 4.442 → attn 0.912) と T2 (scores 3.526 → attn 0.834) を比べると、scores が +0.9 違うだけで attn の集中度が ≈ 8 ポイント違う。softmax の非線形性。",
+      "**attn 行列 [head 1]** の各行を見る。サンプル #1 には述語 token が無いので head 1 は本物の bond 2 が立たず、各行とも T3「花」列で 0.31〜0.40 程度の弱いピーク (位置エンコーディングの混入 × 名詞 K)、他列は 0.10〜0.20 で diffuse になる。これは本物の bond が立たない head 1 の **「待機」状態** で、multi-head の重要な性質: **「全 head が常に強く反応する必要は無い」**。\n\n💡 補足 (Sample #3 で bond 2 を確認): Sample セレクタを #3「私 は 猫 が 好き」に切り替えると:\n  head 0 の T0「私」→T2「猫」 attn = 0.977 (本シミュレータで最も鋭い、bond 1 = 指示詞 → 名詞)\n  head 1 の T4「好き」→T2「猫」 attn = 0.948 (bond 2 = 述語 → 名詞 が立つ)\n head 0 と head 1 が **異なる関係** を **同時に** 拾う Multi-Head の効用が観察できる。",
+    ],
+  },
+  {
+    id: "Lesson 8",
+    title: "Lesson 8. Multi-Head — 役割分担と同時並行",
+    sampleIdx: 2,             // 私 は 猫 が 好き (head 0/1 両方が立つ唯一のサンプル)
+    viewTab: "attn",
+    runForward: true,
+    hint:
+      "Multi-Head Self-Attention は、**1 つの入力 X に対して複数の attention を並列に計算する** 仕組み。" +
+      "head ごとに異なる W_Q / W_K / W_V (実装上は 1 つの大きな重み行列を head ごとに切り出して使う) を持つので、各 head は別々の関係を拾える。\n" +
+      "\n" +
+      "**本 preset の役割分担**\n" +
+      "  head 0: bond 0 (形容詞 → 名詞) + bond 1 (指示詞 → 名詞)  → 修飾語族 attention\n" +
+      "  head 1: bond 2 (述語 → 名詞)                            → 述語族 attention\n" +
+      "サンプル #3「私 は 猫 が 好き」は **本シミュレータで唯一、両 head が同時に強く立つサンプル** (代名詞「私」+ 述語「好き」+ 名詞「猫」が揃っている)。\n" +
+      "\n" +
+      "**なぜ複数 head が必要か**\n" +
+      "1 head だけだと「どの関係を優先するか」を 1 本の Q · K^T で決めなければならず、softmax が 1 つの絞り込みしかできない。" +
+      "Multi-Head にすると「形容詞の Q」「述語の Q」が独立に内積を取り、独立に softmax → 独立に V を集約 → 最後に concat されるので、" +
+      "**同じ token が複数の関係を同時に拾える**。" +
+      "実装上は d_model = h * d_k と分けるだけなので計算量はほぼ変わらない (より浅い d_k で並列に attention を走らせる、と読み替えられる)。\n" +
+      "\n" +
+      "**最終出力 Y の構造**\n" +
+      "各 head の attnOut (T, d_k) を head 軸で concat して (T, h*d_k = d_model) にし、最後に W_O (d_model, d_model) で射影して Y を作る。" +
+      "本 preset は W_O = 単位行列なので Y = concat(attnOut) のまま。Out タブで attnOut [head 0] / attnOut [head 1] / Y を縦に並べて、concat の様子を観察できる。",
+    checks: [
+      "**attn 行列 [head 0]** で T0「私」(指示詞) の行を見る。T2「猫」が ≈ 0.977 と本シミュレータ全体で最も鋭い集中。bond 1 (指示詞 → 名詞) が head 0 で立った結果。同じ head 0 で T4「好き」(述語) の行を見ると、T2「猫」が ≈ 0.273 と弱い (bond 2 は head 1 担当なので head 0 ではほとんど立たない、位置エンコーディングの混入だけ)。",
+      "**attn 行列 [head 1]** で T4「好き」(述語) の行を見る。T2「猫」が ≈ 0.948 と鋭い集中。bond 2 (述語 → 名詞) が head 1 でちゃんと立っている。同じ head 1 で T0「私」(指示詞) の行を見ると、T2「猫」が ≈ 0.489 — これは bond 1 ではなく位置エンコーディングの混入によるもの (Q[T0, h1.d0] = X[T0, d3]·W_Q[d3, h1.d0] のうち X[T0, d3] = 述語 dim の 0 + W_P[t=0, d3]=cos(0)=1 で +1 が混入し、それと K[T2 猫, h1.d0]=+3.91 の積)。本物の bond ではない位置エンコーディング由来の共鳴は緩い集中になる、という観察。",
+      "**Out タブ**で attnOut [head 0] と attnOut [head 1] を見比べる。attnOut[i, head, :] = Σ_j attn[head, i, j] · V[j, head, :] という加重平均。" +
+      "ここで **異なる query が異なる head 経由で「猫」の異なる側面を集めている** 様子を、T0「私」(指示詞、head 0 で活躍) と T4「好き」(述語、head 1 で活躍) の 2 つを並べて確認する。\n\n" +
+      "  **T0「私」 + head 0** — 「猫」の名詞情報を独占的に受信:\n" +
+      "    attnOut [head 0] T0 行: d0 = +3.831、d1 = -0.402、d2 = +0.598、d3 = +0.806、…\n" +
+      "    V[T2「猫」, head 0]:        d0 = +3.91、 d1 = -0.42、 d2 = +0.59、 d3 = +0.81、…\n" +
+      "    attn[head 0, T0「私」, T2「猫」] = 0.977 と独占的なので、attnOut が **ほぼ V[T2「猫」, h0] のコピー**。\n" +
+      "    → 「私」が「猫」の **名詞情報 (d0 = +3.91)** を head 0 で丸ごと受け取った。\n\n" +
+      "  **T0「私」 + head 1** — 「猫」のサイズ特徴の半分しか受信できない:\n" +
+      "    attnOut [head 1] T0 行: d1 = +1.489 (他 token baseline +1.000 + 猫のサイズ特徴 +1 × attn 0.489 = +0.489)\n" +
+      "    attn[head 1, T0「私」, T2「猫」] = 0.489 で T2「猫」が頭一つ抜けるが独占ではない。\n" +
+      "    → 「私」は head 1 では「猫」のサイズ特徴を **半分の強さでしか拾えない**。\n\n" +
+      "  **T4「好き」 + head 1** — 「猫」のサイズ特徴を独占的に受信:\n" +
+      "    attnOut [head 1] T4 行: d1 = +1.948、d7 = +1.286、他 dim はほぼ +1.0 baseline。\n" +
+      "    V[T2「猫」, head 1]:       d1 = +2.000、d7 = +1.300、他は +1.0 baseline。\n" +
+      "    attn[head 1, T4「好き」, T2「猫」] = 0.948 と独占的なので、attnOut が **ほぼ V[T2「猫」, h1] のコピー**。\n" +
+      "    → 「好き」が「猫」の **サイズ特徴 (d1 = +2.000)** と **識別痕跡 D (d7 = +1.300)** を head 1 で丸ごと受け取った。\n\n" +
+      "  **T4「好き」 + head 0** — 「猫」の名詞情報をほとんど受信できない:\n" +
+      "    attnOut [head 0] T4 行: d0 = +1.133 (V[T2「猫」, h0, d0] = +3.91 のほぼ 0.273 倍 + 他 token の V[d0] が混入)\n" +
+      "    attn[head 0, T4「好き」, T2「猫」] = 0.273 だけで分散 (T0=0.180, T1=0.197, T2=0.273, T3=0.183, T4=0.166)。\n" +
+      "    → 「好き」は head 0 では「猫」の名詞情報を **どの token とも混ぜて薄く受け取る** だけ。\n\n" +
+      "💡 Multi-Head の必要性: 上記 4 ケースを並べると **「query × head」の表で X 字型の強さ分布** が見える:\n" +
+      "    head 0 では T0「私」は強く、T4「好き」は弱い。\n" +
+      "    head 1 では T0「私」は弱く、T4「好き」は強い。\n" +
+      "  もし head 0 (修飾語族レーン) しか無ければ、T4「好き」は「猫」のサイズ特徴 (head 1 の V[T2, h1, d1] = +2.000) に到達できず、attnOut が分散したままになる。" +
+      "  もし head 1 (述語族レーン) しか無ければ、T0「私」は「猫」の名詞情報 (head 0 の V[T2, h0, d0] = +3.91) を独占的に集められず、薄い増分しか得られない。" +
+      "  **両方の head があるからこそ、各 query が自分に適した head 経由で「猫」の必要な側面を取り出せる** — これが「役割が違う 2 head の利得」の数値表現。\n\n" +
+      "💡 補足 (concat で 1 つの Y になる): 最終的に attnOut [head 0] と attnOut [head 1] が dim 軸で concat されて Y[i, :] になる。" +
+      "T0「私」の Y は head 0 由来の「名詞情報」と head 1 由来の「サイズ特徴の弱い手がかり」が並ぶ。" +
+      "T4「好き」の Y は head 0 由来の「分散した文法情報」と head 1 由来の「サイズ特徴 +1」が並ぶ。" +
+      "実 Transformer では各 head が学習で異なる役割を獲得するが、本シミュレータは hand-crafted でその「役割分担」を意図的に作って観察可能にしてある。",
+    ],
+  },
+  {
+    id: "Lesson 9",
+    title: "Lesson 9. 残差接続 + LayerNorm",
+    sampleIdx: 2,             // 私 は 猫 が 好き (Lesson 8 と接続。head 0 で T0 私→T2 猫 が独占的)
+    viewTab: "out",
+    runForward: true,
+    hint:
+      "Lesson 8 までで Multi-Head Attention の出力 Y (= concat(attnOut)·W_O) を見た。Transformer のブロックは Y で終わりではなく、**残差接続 + LayerNorm** という 2 段の後処理がある。\n" +
+      "  residual1 = X + Y                                (元 token 情報を Y に足し戻す)\n" +
+      "  ln1_out   = LayerNorm(residual1, γ=1, β=0)        (各 token の dim 分布を平均 0・標準偏差 1 に標準化)\n" +
+      "ln1_out が 1 ブロック分の attention 部の最終出力 (次の Lesson 10 でこの後段に FFN を加える)。\n" +
+      "\n" +
+      "**残差接続 (residual connection) の役目**\n" +
+      "Y は attention で「他 token の情報」を集めたものなので、それだけだと「自分自身が何の token だったか」が薄れる恐れがある。" +
+      "そこで **元の X (= 自分の埋め込み) を足し戻す** ことで、後段に「**自分** + **集めた他 token の情報**」の 2 つを並べた合算ベクトルを渡せる。" +
+      "深い Transformer (層を多数積む場合) では勾配が消えにくくなるという数値安定上の利点もある (本シミュレータは 1 ブロックなのでこちらは観察対象外)。\n" +
+      "\n" +
+      "**LayerNorm の役目**\n" +
+      "残差接続後の residual1 は「自分 + 集めた情報」の合算なので、token によって値の大きさ (mean, std) がばらつく。" +
+      "後段の処理 (次の Lesson で扱う FFN や、複数ブロックを積んだ場合の次ブロック) を **同じスケールで処理させる** ために、各 token (= 各行) について d_model 軸方向で平均 0・標準偏差 1 に揃える。" +
+      "公式: ln1_out[t, d] = γ_d · (residual1[t, d] − μ_t) / √(σ²_t + ε) + β_d (本シミュレータは γ = 1, β = 0 で純粋な標準化)。\n" +
+      "\n" +
+      "**サンプル #3「私 は 猫 が 好き」の T0「私」を題材に観察**\n" +
+      "Lesson 8 で見たように、head 0 で T0「私」→T2「猫」 attention = 0.977 と独占的なので、Y[T0「私」] にはほぼ V[T2「猫」, head 0] (= 「猫」の前半 8 dim) がコピーされている。" +
+      "ここに残差で X[T0「私」] (= 「私」の埋め込み) を足し戻すと、「私のアイデンティティ + 猫から集めた情報」の合算が見られる。",
+    checks: [
+      "**Out タブ**で T0「私」の行を 3 段比較する: X (Embed タブ最下段)、Y、residual1。\n" +
+      "  d0 (= 名詞 dim): X = +0.000 (「私」は名詞ではない) → Y = +3.831 (attention で「猫」の名詞情報を獲得) → residual1 = +0.000 + +3.831 = **+3.831** (Y そのまま、X が 0 なので)。\n" +
+      "  d2 (= 指示詞 dim): X = +3.000 (「私」は指示詞、Lesson 1 で見た値) → Y = +0.598 (位置エンコーディングの混入経由) → residual1 = +3.000 + +0.598 = **+3.598** (元の指示詞情報 +3 を **保持しつつ** attention で集めた小さな値を加算)。\n\n" +
+      "💡 解釈: 残差接続は「**自分が持っていた情報を維持しつつ、attention で集めた他 token の情報を加算する**」操作。d0 では「私」は元々 0 だったので攻撃的に「猫の名詞情報 +3.831」を取り込み、d2 では元の「私 = 指示詞」情報 +3.000 が薄まらずに保たれた。**残差が無ければ d2 の +3.000 が +0.598 に置き換わってしまい、「私が指示詞である」という情報が失われていた**。",
+      "**Out タブ**で T0「私」の residual1 と ln1_out を比較する。\n" +
+      "  residual1 [T0「私」] の d0 は +3.831、d4 は +0.235、… 各 dim でバラつく。行全体の平均 μ = +1.453、標準偏差 σ = 1.243 (token によって違う)。\n" +
+      "  ln1_out [T0「私」] の d0 は +1.913、d4 は -0.981、… 各 dim を (residual1 - μ) / σ で標準化したもの。**行全体の平均 = 0、標準偏差 = 1**。\n" +
+      "  例えば d0: (+3.831 - 1.453) / 1.243 = +1.913 ✓\n" +
+      "  d2: (+3.598 - 1.453) / 1.243 = +1.726 ✓ (実値 +1.726)\n" +
+      "セル ln1_out[T0「私」, d0] をクリックすると μ・σ・標準化の手順が「式の展開」タブで段階展開される。\n\n" +
+      "💡 解釈: LayerNorm 後も **dim 間の相対関係は保たれる** (d0 が一番大きい、d4 が一番小さい、という順序は不変)。変わるのは絶対値の大きさが揃うこと。これにより後段が token ごとのスケール差に振り回されず、同じ重みで安定して処理できる。",
+      "**Out タブ**で全 token の ln1_out 行を眺める。各行の dim 値の幅は ≈ ±2 程度に揃っている。\n" +
+      "  比較として residual1 を眺めると、T2「猫」(名詞) は d0 = +4.91 と特に大きく、T1「は」(助詞) は最大 +3.81 程度、と token によって絶対値の大きさが違う。\n" +
+      "  ln1_out では各行が **mean = 0, std ≈ 1.0** に正規化されるので、行ごとの「値の大きさ自体」は揃う。各 token の **dim 間の相対パターン** だけが残り、後段 (Lesson 10 で扱う FFN) はこれを共通スケールで処理できる。\n\n" +
+      "💡 補足 (なぜ token 単位で正規化するか): 例えば T2「猫」のように「名詞 +3 + 美しさ特徴 +1 + 位置エンコーディング ±1」が合算されて値が大きくなった token と、T1「は」のように「位置エンコーディング ±1」だけしか持たない token を、後段で **同じ重み** で処理しようとすると、T2 だけが過剰に発火してしまう。LayerNorm で dim 軸を正規化すると、各 token のベクトルが「dim 間のパターン (= どの dim が他より大きいか)」だけを情報として持つ形になり、後段が安定する。",
+    ],
+  },
+  {
+    id: "Lesson 10",
+    title: "Lesson 10. FFN (Feed-Forward Network) と 1 ブロック完成",
+    sampleIdx: 2,             // 私 は 猫 が 好き (head 0/1 両方が立つ)
+    viewTab: "ffn",
+    runForward: true,
+    hint:
+      "Lesson 9 までで Attention 部 (Multi-Head + 残差 + LayerNorm) を見た。Transformer block の後半は **FFN (Feed-Forward Network)** という per-token の 2 層 MLP。" +
+      "各 token を独立に処理する点が attention と対照的: attention は token 間の関係を扱うが、**FFN は同じ位置の token を独立に変換** する。\n" +
+      "  ffn_pre = ln1_out · W1 + b1            shape (T, d_ff=32)   ← d_model→d_ff の射影\n" +
+      "  ffn_h   = GELU(ffn_pre)                shape (T, d_ff)       ← 活性化関数で正の信号だけ通す\n" +
+      "  ffn_out = ffn_h · W2 + b2              shape (T, d_model)    ← d_ff→d_model の書き戻し\n" +
+      "その後 2 回目の残差 + LayerNorm:\n" +
+      "  residual2 = ln1_out + ffn_out\n" +
+      "  ln2_out   = LayerNorm(residual2)        ← block 最終出力\n" +
+      "\n" +
+      "**本シミュレータの FFN は「検出器ニューロン」設計**\n" +
+      "preset で W1 / W2 を hand-crafted して、各 hidden ニューロン (ffn_h の各 dim) が **特定 dim パターンを検出する閾値ロジック** になるよう作ってある。\n" +
+      "  h0..h11: 単 dim 検出器 (h0 = 名詞 dim、h2 = 指示詞 dim、h11 = 人気度 など)\n" +
+      "  h12..h15: AND 検出器 (h12 = 名詞 ∧ 美しさ、h13 = 名詞 ∧ サイズ、h14 = 名詞 ∧ 書物、h15 = 名詞 ∧ 人気度)\n" +
+      "  h16..h31: 未使用 (W1, W2 = 0)\n" +
+      "\n" +
+      "**W2 で「検出器の活性 → 出力 dim」**\n" +
+      "h0..h11 は対応する d 番に identity で書き戻す (= 検出した特徴を維持)。h12..h15 (AND 検出器) は **対応する特徴 dim に +0.5 の追加加算** をする (= 「美しい名詞」を検出したら「美しさ特徴」を強化)。\n" +
+      "これが「FFN は **knowledge memory** として動く」という解釈の数値表現。検出器は素朴な閾値ロジックだが、組み合わせ検出 (AND) で attention だけでは捉えにくい「カテゴリ ∧ 特徴」のパターンを処理できる。\n" +
+      "\n" +
+      "**FFN タブの見かた**\n" +
+      "上から順に W1、ffn_h、W2、ffn_out、residual2、ln2_out が並ぶ。サンプル #3「私 は 猫 が 好き」で各 token の検出器がどう発火するかを観察する。",
+    checks: [
+      "**FFN タブ**で **ffn_h** (T × 32 行列) の T0「私」(指示詞) 行を見る。発火している (値 > 0.5) 検出器は h0 (名詞 +0.75)、h2 (指示詞 +0.56)、h13 (名詞∧サイズ +1.00)、h15 (名詞∧人気度 +0.75)。\n" +
+      "  h2 (指示詞 dim 検出器) が発火するのは正常 (「私」自身が指示詞)。\n" +
+      "  h0 (名詞検出器) も発火している — これは Lesson 9 で見たように、attention で「猫」の名詞情報 +3.831 を取り込んだ結果、ln1_out [T0, d0] が +1.913 と高くなっているため。\n" +
+      "  h13 (名詞∧サイズ検出器) と h15 (名詞∧人気度検出器) も発火 — 同じく attention 経由で「猫」のサイズ特徴情報を引き継いでいる。\n\n" +
+      "💡 解釈: FFN は **「自分自身の dim」と「attention で集めた dim」を両方見て複合パターンを検出する**。h13 は「名詞 dim ∧ サイズ dim」が同時に立っているので「サイズを持つ名詞」を捉えたという解釈。「私」は指示詞だが attention で「猫」のサイズ特徴を継承しているため検出器が発火する。これが「私が猫について何かを言っている」文脈を形にしている。",
+      "**FFN タブ**で **ffn_h** の T1「は」(助詞)、T3「が」(助詞)、T4「好き」(述語) の各行を比べる。\n" +
+      "  T1「は」: h4 (は dim 検出器) のみ +0.87 と発火。他はほぼ 0。\n" +
+      "  T3「が」: h5 (が dim 検出器) のみ +1.72 と発火。\n" +
+      "  T4「好き」: h3 (述語 dim 検出器) のみ +1.17 と発火。\n\n" +
+      "💡 解釈: 各 token はその文法カテゴリに対応した単 dim 検出器が選択的に発火し、**ベクトル化された「品詞ラベル」** のような表現になっている。実 Transformer ではこの段階で「単語の意味 + 文脈情報」が学習で抽出されるが、本シミュレータは hand-crafted で素朴な「ラベル化」を行う。\n\n" +
+      "💡 補足 (W1[d2, h2] のセル): クリックすると preset 設計意図 (h2 = 指示詞 dim 検出器) の説明が「式の展開」タブに出る。ffn_h セルもクリックすれば、各 token でどの入力 dim が発火に寄与したか段階展開で見える。",
+      "**FFN タブ**で **ffn_out** と **residual2** を比べる。ffn_out は「検出器活性を d_model に書き戻したもの」(検出した dim だけ非ゼロ)。residual2 = ln1_out + ffn_out で、ln1_out (= attention 部の出力) に FFN の差分情報を加算する。最後の **ln2_out が 1 ブロック分の最終出力**。各行の mean=0, std≈1 に標準化されている。\n" +
+      "  T2「猫」の ln2_out 行: d0 (名詞 dim) = +2.69 が支配的、d9 (サイズ特徴) = +1.74 — 「猫はサイズ特徴を持つ名詞」という情報が dim 0 と dim 9 にそれぞれ強く現れる。\n\n" +
+      "💡 解釈: 1 ブロック分の Transformer 処理が完結した。流れをまとめると:\n" +
+      "  X (素朴な埋め込み) → 〔Q/K/V → attention → 集約〕 → 残差 → LN1 → 〔FFN: 検出 → 書き戻し〕 → 残差 → LN2 = 出力。\n" +
+      "実 Transformer ではこの block を **何層も積む**ことで深い表現学習を実現する。本シミュレータは N=1 の 1 ブロックだが、各段階の働き (attention で関係性を集める、FFN でパターンを検出する、残差で元情報を保持する、LN で正規化する) を **同じ token に対して通しで観察** することで Transformer の forward 1 周分が手で追える形になっている。",
+    ],
+  },
+]);
+
+/**
+ * id 指定で Lesson を引く。
+ * @param {string} id "Lesson 1"〜"Lesson 10"
+ * @returns {Lesson | null}
+ */
+function getLesson(id) {
+  return LESSONS.find((l) => l.id === id) ?? null;
+}
+
+
+// ---------- model.js ----------
+
+// model.js — Transformer Self-Attention forward (Tier 2: Multi-Head 対応)。
+//
+// 設計書 §5.1, §6 + §6.6 (Multi-Head) に対応。preset (hand-crafted の JSON) を
+// 受け取って、入力 token 列に対する forward を計算する。学習機能は無い。
+//
+// すべての行列は Float64Array の 1 次元配列で持つ (matrix.js の規約)。
+// アクセスは A[r * cols + c]。Multi-Head の Q/K/V/scores/attn/attnOut も
+// 同じ Float64Array に格納し、head 軸はストライドで暗黙化する:
+//   Q.length = T * h * d_k
+//   Q[t, hi, k] = Q[(t * h + hi) * d_k + k]
+//   scores.length = h * T * T
+//   scores[hi, i, j] = scores[hi * T * T + i * T + j]
+
+
+/**
+ * preset (= JSON object) から Transformer net インスタンスを構築する。
+ *
+ * @param {object} args.preset  presets/japanese-mini-v1.json と同じ形式の object
+ * @returns {object} net — 重みと中間結果バッファをすべて持つ object
+ */
+function createTransformer({ preset }) {
+  if (!preset || !preset.config || !preset.weights) {
+    throw new Error("createTransformer: preset には config と weights が必要");
+  }
+  const { T, d_model, h, d_k, vocabSize, N } = preset.config;
+  if (h * d_k !== d_model) {
+    throw new Error(`createTransformer: h*d_k (${h * d_k}) != d_model (${d_model})`);
+  }
+  if (N !== 1) {
+    throw new Error(`Tier 2 の model.js は N=1 のみ対応。preset N=${N}`);
+  }
+
+  // 重み (固定、preset から読み込み)
+  const W_E = fromNestedArray(preset.weights.W_E);     // (vocabSize, d_model)
+  const W_P = fromNestedArray(preset.weights.W_P);     // (T, d_model)
+  const block0 = preset.weights.blocks[0];
+  const W_Q = fromNestedArray(block0.W_Q);             // (d_model, h*d_k)
+  const W_K = fromNestedArray(block0.W_K);             // (d_model, h*d_k)
+  const W_V = fromNestedArray(block0.W_V);             // (d_model, h*d_k)
+  const W_O = fromNestedArray(block0.W_O);             // (h*d_k, d_model)
+  // LayerNorm パラメータ (γ=1, β=0 で固定。学習要素ゼロ)
+  // 1D ベクトルなので fromNestedArray (2D 用) は使わず Float64Array.from で読み込む。
+  const LN1_gamma = Float64Array.from(block0.LN1_gamma); // (d_model,)
+  const LN1_beta  = Float64Array.from(block0.LN1_beta);  // (d_model,)
+  // FFN: 2 層 MLP (d_model → d_ff → d_model) + GELU
+  const d_ff = preset.config.d_ff;
+  const FFN_W1 = fromNestedArray(block0.FFN_W1);         // (d_model, d_ff)
+  const FFN_b1 = Float64Array.from(block0.FFN_b1);       // (d_ff,)
+  const FFN_W2 = fromNestedArray(block0.FFN_W2);         // (d_ff, d_model)
+  const FFN_b2 = Float64Array.from(block0.FFN_b2);       // (d_model,)
+  // FFN 後の 2 回目残差 + LN2
+  const LN2_gamma = Float64Array.from(block0.LN2_gamma); // (d_model,)
+  const LN2_beta  = Float64Array.from(block0.LN2_beta);  // (d_model,)
+
+  // 中間結果バッファ (forward で書き込まれる)
+  const tokens   = new Int32Array(T);
+  const X        = new Float64Array(T * d_model);
+  // Q/K/V は (T, h, d_k) を 1D 化。サイズは T * h * d_k = T * d_model
+  const Q        = new Float64Array(T * h * d_k);
+  const K        = new Float64Array(T * h * d_k);
+  const V        = new Float64Array(T * h * d_k);
+  // scores / attn は (h, T, T) を 1D 化。サイズは h * T * T
+  const scores   = new Float64Array(h * T * T);
+  const attn     = new Float64Array(h * T * T);
+  // attnOut は (T, h, d_k) (= (T, h*d_k) と同等のメモリ)
+  const attnOut  = new Float64Array(T * h * d_k);
+  const Y        = new Float64Array(T * d_model);
+  // 残差 + LayerNorm (Lesson 9)
+  const residual1 = new Float64Array(T * d_model);
+  const ln1_out   = new Float64Array(T * d_model);
+  // FFN (Lesson 10)
+  const ffn_pre  = new Float64Array(T * d_ff);   // GELU 入力 (= ln1_out · W1 + b1)
+  const ffn_h    = new Float64Array(T * d_ff);   // GELU 出力 (= 検出器の活性)
+  const ffn_out  = new Float64Array(T * d_model); // = ffn_h · W2 + b2
+  const residual2 = new Float64Array(T * d_model); // = ln1_out + ffn_out
+  const ln2_out   = new Float64Array(T * d_model); // block 最終出力
+
+  return {
+    // ハイパパラメータ
+    T, d_model, h, d_k, d_ff, vocabSize, N,
+    vocab: preset.config.vocab.slice(),
+
+    // 重み (固定)
+    W_E, W_P,
+    blocks: [{
+      W_Q, W_K, W_V, W_O,
+      LN1_gamma, LN1_beta,
+      FFN_W1, FFN_b1, FFN_W2, FFN_b2,
+      LN2_gamma, LN2_beta,
+    }],
+
+    // 中間結果
+    tokens, X, Q, K, V, scores, attn, attnOut, Y,
+    residual1, ln1_out,
+    ffn_pre, ffn_h, ffn_out, residual2, ln2_out,
+
+    // メタ
+    presetName: preset.name ?? "(unknown)",
+    presetMeta: {
+      kind: preset.kind,
+      version: preset.version,
+      tier: preset.tier,
+      description: preset.description,
+      designIntent: preset.designIntent,
+    },
+    phase: "idle",
+  };
+}
+
+/**
+ * Tier 2 forward (Multi-Head Self-Attention):
+ *   X = W_E[tokens] + W_P
+ *   Q_full = X · W_Q,  K_full = X · W_K,  V_full = X · W_V    (T × h*d_k)
+ *   per head hi:
+ *     scores_hi[i, j] = (Q[t=i, hi, :] · K[t=j, hi, :]) / √d_k
+ *     attn_hi   = softmax(scores_hi)
+ *     out_hi    = attn_hi · V_hi    (T × d_k)
+ *   concat heads → (T, h*d_k = d_model)
+ *   Y = concat · W_O     (T × d_model)
+ *
+ * 入力 tokens は長さ T の Int32Array (vocab id 列)。net.tokens にコピーして
+ * net.X / Q / K / V / scores / attn / attnOut / Y を順に埋める。
+ *
+ * @param {object} net
+ * @param {Int32Array | number[]} tokens
+ * @returns {Float64Array} net.Y (出力)
+ */
+function forward(net, tokens) {
+  const { T, d_model, h, d_k, vocabSize } = net;
+  if (tokens.length !== T) {
+    throw new Error(`forward: tokens.length=${tokens.length} !== T=${T}`);
+  }
+  // tokens を内部にコピー、範囲チェック
+  for (let t = 0; t < T; t++) {
+    const id = tokens[t];
+    if (!Number.isInteger(id) || id < 0 || id >= vocabSize) {
+      throw new Error(`forward: tokens[${t}]=${id} は範囲外 (0..${vocabSize - 1})`);
+    }
+    net.tokens[t] = id;
+  }
+
+  // (1) X = W_E[tokens] + W_P
+  for (let t = 0; t < T; t++) {
+    const tokenId = net.tokens[t];
+    const wOff = tokenId * d_model;
+    const pOff = t * d_model;
+    const xOff = t * d_model;
+    for (let d = 0; d < d_model; d++) {
+      net.X[xOff + d] = net.W_E[wOff + d] + net.W_P[pOff + d];
+    }
+  }
+
+  // (2) Q/K/V を「concat 全 head」の形で計算: shape (T, h*d_k) = (T, d_model)
+  // matmul の出力サイズに合わせて、Q/K/V も内部レイアウトでは (T, h*d_k) = (T, d_model) と等価。
+  const block0 = net.blocks[0];
+  const hd = h * d_k;
+  matmul(net.X, T, d_model, block0.W_Q, hd, net.Q);
+  matmul(net.X, T, d_model, block0.W_K, hd, net.K);
+  matmul(net.X, T, d_model, block0.W_V, hd, net.V);
+
+  // (3) head ごとの scores/attn/out を計算
+  // Q[t, hi, k] = net.Q[(t * h + hi) * d_k + k]?  ← W_Q の cols 0..hd-1 は
+  //   col index = hi * d_k + k に対応する (hi: head index, k: head 内の dim)。
+  // つまり Q の格納順は (T, h, d_k) を [t][hi][k] フラット化したものではなく、
+  // (T, h*d_k) を [t][hi*d_k + k] とした **同じ** メモリレイアウト。
+  // → どちらの解釈でも net.Q[(t * h + hi) * d_k + k] = net.Q[t * hd + hi * d_k + k] と同値。
+  const invSqrtDk = 1 / Math.sqrt(d_k);
+  // scores buffer は (h, T, T)
+  for (let hi = 0; hi < h; hi++) {
+    const sOff = hi * T * T;
+    for (let i = 0; i < T; i++) {
+      const qOff = i * hd + hi * d_k;
+      for (let j = 0; j < T; j++) {
+        const kOff = j * hd + hi * d_k;
+        let s = 0;
+        for (let k = 0; k < d_k; k++) {
+          s += net.Q[qOff + k] * net.K[kOff + k];
+        }
+        net.scores[sOff + i * T + j] = s * invSqrtDk;
+      }
+    }
+    // softmax row-wise on (T, T) sub-buffer
+    softmax(net.scores.subarray(sOff, sOff + T * T), T, T,
+            net.attn.subarray(sOff, sOff + T * T));
+    // attnOut[t, hi, :] = sum_j attn[hi, t, j] * V[j, hi, :]  → (T, d_k)
+    for (let i = 0; i < T; i++) {
+      const oOff = i * hd + hi * d_k;
+      // 初期化
+      for (let k = 0; k < d_k; k++) net.attnOut[oOff + k] = 0;
+      for (let j = 0; j < T; j++) {
+        const a = net.attn[sOff + i * T + j];
+        const vOff = j * hd + hi * d_k;
+        for (let k = 0; k < d_k; k++) {
+          net.attnOut[oOff + k] += a * net.V[vOff + k];
+        }
+      }
+    }
+  }
+
+  // (4) Y = concat(attnOut) · W_O    (concat は attnOut のメモリ配置がすでに (T, h*d_k))
+  matmul(net.attnOut, T, hd, block0.W_O, d_model, net.Y);
+
+  // (5) 残差接続: residual1 = X + Y
+  for (let t = 0; t < T; t++) {
+    const off = t * d_model;
+    for (let d = 0; d < d_model; d++) {
+      net.residual1[off + d] = net.X[off + d] + net.Y[off + d];
+    }
+  }
+
+  // (6) LayerNorm 1: ln1_out = γ * (residual1 - μ) / sqrt(σ² + ε) + β
+  //   per-token (= 各行ごとに d_model 軸方向で正規化)。
+  //   PyTorch F.layer_norm 互換 (有偏分散、分母 N=d_model)。
+  const LN_EPS = 1e-5;
+  layerNormPerToken(net.residual1, T, d_model, block0.LN1_gamma, block0.LN1_beta, net.ln1_out, LN_EPS);
+
+  // (7) FFN: ffn_pre = ln1_out · W1 + b1   (T × d_ff)
+  const d_ff = net.d_ff;
+  matmul(net.ln1_out, T, d_model, block0.FFN_W1, d_ff, net.ffn_pre);
+  for (let t = 0; t < T; t++) {
+    const off = t * d_ff;
+    for (let k = 0; k < d_ff; k++) net.ffn_pre[off + k] += block0.FFN_b1[k];
+  }
+  // (8) ffn_h = GELU(ffn_pre)
+  gelu(net.ffn_pre, net.ffn_h);
+  // (9) ffn_out = ffn_h · W2 + b2   (T × d_model)
+  matmul(net.ffn_h, T, d_ff, block0.FFN_W2, d_model, net.ffn_out);
+  for (let t = 0; t < T; t++) {
+    const off = t * d_model;
+    for (let d = 0; d < d_model; d++) net.ffn_out[off + d] += block0.FFN_b2[d];
+  }
+
+  // (10) 2 回目の残差: residual2 = ln1_out + ffn_out
+  for (let t = 0; t < T; t++) {
+    const off = t * d_model;
+    for (let d = 0; d < d_model; d++) {
+      net.residual2[off + d] = net.ln1_out[off + d] + net.ffn_out[off + d];
+    }
+  }
+  // (11) LayerNorm 2: ln2_out = LayerNorm(residual2)
+  layerNormPerToken(net.residual2, T, d_model, block0.LN2_gamma, block0.LN2_beta, net.ln2_out, LN_EPS);
+
+  net.phase = "forward";
+  return net.ln2_out;
+}
+
+// per-token LayerNorm: 各行ごとに d_model 軸方向で平均/分散を取って標準化、γ/β を適用。
+function layerNormPerToken(input, T, d_model, gamma, beta, output, eps) {
+  for (let t = 0; t < T; t++) {
+    const off = t * d_model;
+    let mu = 0;
+    for (let d = 0; d < d_model; d++) mu += input[off + d];
+    mu /= d_model;
+    let var_ = 0;
+    for (let d = 0; d < d_model; d++) {
+      const dx = input[off + d] - mu;
+      var_ += dx * dx;
+    }
+    var_ /= d_model;
+    const invStd = 1 / Math.sqrt(var_ + eps);
+    for (let d = 0; d < d_model; d++) {
+      const x_norm = (input[off + d] - mu) * invStd;
+      output[off + d] = gamma[d] * x_norm + beta[d];
+    }
+  }
+}
+
+/**
+ * 状態を「forward 前」に戻す。重みは触らない。
+ */
+function reset(net) {
+  net.tokens.fill(0);
+  net.X.fill(0);
+  net.Q.fill(0);
+  net.K.fill(0);
+  net.V.fill(0);
+  net.scores.fill(0);
+  net.attn.fill(0);
+  net.attnOut.fill(0);
+  net.Y.fill(0);
+  net.residual1.fill(0);
+  net.ln1_out.fill(0);
+  net.ffn_pre.fill(0);
+  net.ffn_h.fill(0);
+  net.ffn_out.fill(0);
+  net.residual2.fill(0);
+  net.ln2_out.fill(0);
+  net.phase = "idle";
+}
+
+// ─── Multi-Head アクセサ ──────────────────────────────────
+// view.js / explain.js から「特定 head の (T, d_k) 部分」を取り出すヘルパ。
+// メモリは net.Q etc. を共有する (subarray が view を返す)。
+
+/**
+ * net.Q / K / V の特定 head 分を (T, d_k) view として返す。
+ *
+ * メモリ配置: net.Q[t, hi, k] = net.Q[t * h * d_k + hi * d_k + k]
+ * このとき特定 head の slice は連続ではなく、各 row が dt = h * d_k
+ * 単位で step する。なので普通の subarray では取れず、コピーする。
+ *
+ * @param {Float64Array} buf  (T * h * d_k)
+ * @param {number} T
+ * @param {number} h
+ * @param {number} d_k
+ * @param {number} hi
+ * @returns {Float64Array}  (T, d_k) を 1D 化したもの
+ */
+function headSliceTHD(buf, T, h, d_k, hi) {
+  const out = new Float64Array(T * d_k);
+  const hd = h * d_k;
+  for (let t = 0; t < T; t++) {
+    const src = t * hd + hi * d_k;
+    const dst = t * d_k;
+    for (let k = 0; k < d_k; k++) out[dst + k] = buf[src + k];
+  }
+  return out;
+}
+
+/**
+ * net.scores / attn の特定 head 分を (T, T) view として返す。
+ * メモリ配置: net.scores[hi, i, j] = net.scores[hi * T * T + i * T + j]
+ * 特定 head は連続なので subarray で view を取れる。
+ *
+ * @param {Float64Array} buf  (h * T * T)
+ * @param {number} T
+ * @param {number} hi
+ * @returns {Float64Array} 長さ T*T の view
+ */
+function headSliceHTT(buf, T, hi) {
+  return buf.subarray(hi * T * T, (hi + 1) * T * T);
+}
+
+
+// ---------- view.js ----------
+
+// view.js — Tier 1 ネットワーク・ビューの SVG 描画 + pan/zoom。
+//
+// 設計書 §7 (可視化) に対応:
+//   - 中央パネルに行列ヒートマップを並べる (行ヘッダ = 単語ラベル、列ヘッダ = dim 番号)
+//   - タブ (Embed / Q-K-V / Attn / Out) で表示する行列セットを切り替える
+//   - SVG viewBox を drag/wheel で pan/zoom できる
+//
+// インタラクション (セルクリック → 式の展開、ホバーでハイライト) は P5 で追加する。
+// 本ファイルは「現状の net.X / Q / K / V / scores / attn / attnOut / Y を読んで描く」だけ。
+
+
+// ─── レイアウト定数 ────────────────────────────────────────
+
+const LAYOUT = {
+  cellW: 50,         // セルの幅 (10 px の値「+0.412」が収まる)
+  cellH: 22,         // セルの高さ
+  rowLabelW: 90,     // 行ラベル (例: "T0 これ") の幅
+  colLabelH: 18,     // 列ラベル (例: "d0") の高さ
+  matrixGap: 30,     // 行列間の縦余白
+  matrixTitleH: 18,  // 行列名 (例: "X") の高さ
+  matrixShapeH: 14,  // 行列形状 (例: "(T × d_model)") の高さ
+};
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function el(tag, attrs = {}, children = []) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+  for (const c of (Array.isArray(children) ? children : [children])) {
+    if (c == null) continue;
+    if (typeof c === "string") e.appendChild(document.createTextNode(c));
+    else e.appendChild(c);
+  }
+  return e;
+}
+
+/**
+ * View のインスタンスを作成。SVG ルート要素と net (model.js) を受け取り、
+ * pan/zoom 状態と現在表示中タブを内部に持つ。
+ *
+ * @param {SVGElement} svg
+ * @param {object} net — model.js の createTransformer 戻り値
+ * @param {object} [handlers] — { onCellClick({matrix,row,col}) }
+ * @returns {object} view
+ */
+function createView(svg, net, handlers = {}) {
+  const view = {
+    svg,
+    net,
+    activeTab: "embed",       // 'embed' | 'qkv' | 'attn' | 'out'
+    viewBox: { x: 0, y: 0, w: 1000, h: 600 },
+    naturalSize: { w: 1000, h: 600 },
+    handlers,
+    selection: null,          // { matrix, row, col }
+  };
+  installPanZoom(view);
+  return view;
+}
+
+/**
+ * 現在の選択 (= 「式の展開」で表示中のセル) を更新して再描画。
+ */
+function setSelection(view, sel) {
+  view.selection = sel;
+  renderAll(view);
+}
+
+/**
+ * net の現在の値で SVG を全描画。Forward 後・タブ切り替え後・Reset 後に呼ぶ。
+ */
+function renderAll(view) {
+  const { svg, net } = view;
+  // 既存 children を全クリア
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  // ルート <g>。pan/zoom は viewBox で制御するので transform は使わない。
+  const g = el("g", { class: "g-content" });
+  svg.appendChild(g);
+
+  // タブごとに「描画する行列リスト」を組み立て、縦に並べて描画する。
+  const matrices = matricesForTab(view.activeTab, net);
+  let yCursor = 8;
+  let maxRight = 0;
+  for (const spec of matrices) {
+    const drawn = drawMatrix(g, spec, yCursor, view);
+    yCursor = drawn.bottomY + LAYOUT.matrixGap;
+    maxRight = Math.max(maxRight, drawn.rightX);
+  }
+
+  // viewBox の自然サイズを計算してリセット
+  view.naturalSize.w = Math.max(maxRight + 16, 600);
+  view.naturalSize.h = Math.max(yCursor + 16, 400);
+  // 現在の viewBox サイズを保ったまま svg にセットし直す
+  // (初回 / Fit ボタン押下時は applyZoomFit() で自然サイズ全体を表示)
+  applyViewBox(view);
+}
+
+/**
+ * 表示するタブを切り替えて再描画。
+ *
+ * 注意: applyZoomFit は naturalSize を参照するので、必ず renderAll で
+ * 新しい naturalSize を計算した後に呼ぶ。順序を逆にすると、古いタブの
+ * naturalSize で viewBox を設定してしまい初期表示が歪む。
+ */
+function setTab(view, tabName) {
+  if (!["embed", "qkv", "attn", "out", "ffn"].includes(tabName)) {
+    throw new Error(`Unknown tab: ${tabName}`);
+  }
+  view.activeTab = tabName;
+  renderAll(view);     // まず新タブを描画 → naturalSize 更新
+  applyZoomFit(view);  // 新しい naturalSize で全体表示にリセット
+}
+
+/**
+ * pan/zoom: viewBox を初期 (= 全体表示) に戻す。
+ */
+function applyZoomFit(view) {
+  view.viewBox.x = 0;
+  view.viewBox.y = 0;
+  view.viewBox.w = view.naturalSize.w;
+  view.viewBox.h = view.naturalSize.h;
+  applyViewBox(view);
+}
+
+/**
+ * pan/zoom: ズーム倍率を 1.0× に固定 (中心を保ったまま)。
+ */
+function applyZoom100(view) {
+  // viewBox の幅 = SVG の DOM 上の幅 にすれば 1px = 1 unit。
+  const rect = view.svg.getBoundingClientRect();
+  const cx = view.viewBox.x + view.viewBox.w / 2;
+  const cy = view.viewBox.y + view.viewBox.h / 2;
+  view.viewBox.w = rect.width || view.naturalSize.w;
+  view.viewBox.h = rect.height || view.naturalSize.h;
+  view.viewBox.x = cx - view.viewBox.w / 2;
+  view.viewBox.y = cy - view.viewBox.h / 2;
+  applyViewBox(view);
+}
+
+/**
+ * 現在のズーム倍率を返す。
+ * preserveAspectRatio="xMidYMid meet" は viewBox 全体を DOM 矩形に収めるよう
+ * 一様縮小するので、実際のスケールは min(rect.w / vbW, rect.h / vbH)。
+ * (X 軸比だけを返すと Y 軸が支配的なときに視覚スケールと大きくズレる。)
+ */
+function currentZoom(view) {
+  const rect = view.svg.getBoundingClientRect();
+  if (!rect.width || !rect.height || !view.viewBox.w || !view.viewBox.h) return 1.0;
+  const sx = rect.width  / view.viewBox.w;
+  const sy = rect.height / view.viewBox.h;
+  return Math.min(sx, sy);
+}
+
+/**
+ * 中心アンカーで viewBox を factor 倍する (factor < 1 でズームイン)。
+ * ホイールズームと同じロジックをマウス位置の代わりに「中央」固定で適用。
+ */
+function applyZoomDelta(view, factor) {
+  const cx = view.viewBox.x + view.viewBox.w / 2;
+  const cy = view.viewBox.y + view.viewBox.h / 2;
+  view.viewBox.w *= factor;
+  view.viewBox.h *= factor;
+  view.viewBox.x = cx - view.viewBox.w / 2;
+  view.viewBox.y = cy - view.viewBox.h / 2;
+  applyViewBox(view);
+}
+
+// ─── 内部ヘルパ ────────────────────────────────────────────
+
+function applyViewBox(view) {
+  const { x, y, w, h } = view.viewBox;
+  view.svg.setAttribute("viewBox", `${x} ${y} ${w} ${h}`);
+  view.svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+}
+
+/**
+ * 指定タブで表示する行列スペック群を組み立てる。
+ * spec: { title, shape, rows, cols, data, mode, rowLabels, colLabels }
+ *   mode = "signed" (青=負/赤=正) | "attn" (青濃淡 0..1)
+ */
+function matricesForTab(tab, net) {
+  const T = net.T, D = net.d_model, K = net.d_k;
+  const wordOf = (i) => net.vocab[net.tokens[i]] ?? "?";
+  const tokenLabels = Array.from({ length: T }, (_, i) => `T${i} ${wordOf(i)}`);
+  const dimLabels = (n) => Array.from({ length: n }, (_, i) => `d${i}`);
+
+  if (tab === "embed") {
+    // W_E から現在の tokens 分の行だけ抜き出した「ビュー」を一時的に作る。
+    // Lesson 2 で「token 埋め込み」と「位置エンコーディング」を独立に観察するため、
+    // X (= W_E + W_P) と並べて 3 行列を表示する。
+    const WE_selected = new Float64Array(T * D);
+    for (let t = 0; t < T; t++) {
+      const tid = net.tokens[t];
+      for (let d = 0; d < D; d++) {
+        WE_selected[t * D + d] = net.W_E[tid * D + d];
+      }
+    }
+    const posLabels = Array.from({ length: T }, (_, i) => `pos ${i}`);
+    return [
+      {
+        matrixKey: "W_E",
+        title: "W_E[tokens[t], :]   token 埋め込み (位置に依存せず token の意味だけ)",
+        shape: `(T=${T}) × (d_model=${D})`,
+        rows: T, cols: D, data: WE_selected, mode: "signed",
+        rowLabels: tokenLabels, colLabels: dimLabels(D),
+      },
+      {
+        matrixKey: "W_P",
+        title: "W_P[t, :]   位置エンコーディング (token と無関係に位置だけで決まる sin/cos)",
+        shape: `(T=${T}) × (d_model=${D})`,
+        rows: T, cols: D, data: net.W_P, mode: "signed",
+        rowLabels: posLabels, colLabels: dimLabels(D),
+      },
+      {
+        matrixKey: "X",
+        title: "X = W_E[tokens] + W_P   (上 2 つの和、Q/K/V 計算の入力)",
+        shape: `(T=${T}) × (d_model=${D})`,
+        rows: T, cols: D, data: net.X, mode: "signed",
+        rowLabels: tokenLabels, colLabels: dimLabels(D),
+      },
+    ];
+  }
+  if (tab === "qkv") {
+    // Tier 2 (Multi-Head): W_Q / W_K / W_V は global (d_model, h*d_k) で表示し、
+    // 出力 Q / K / V は head 別に縦に並べる。各 head の cell は (T, d_k)。
+    const block0 = net.blocks[0];
+    const h = net.h;
+    const HD = h * K;       // = d_model
+
+    /** weight 行列の列ヘッダで「head 境界」を見せるためのラベル。
+     * d_k=8 のとき: d0 d1 ... d7 | d0 d1 ... d7 を head 0/1 として表示。 */
+    const colHeadLabels = (n) => Array.from({ length: n }, (_, c) => {
+      const hi = Math.floor(c / K);
+      const k  = c % K;
+      return `h${hi}.d${k}`;
+    });
+
+    /** head hi の Q を (T, d_k) に切り出して spec を作る。 */
+    const headSpec = (matrixKey, baseTitle, buf, hi) => ({
+      matrixKey: `${matrixKey}_h${hi}`,
+      title: `${baseTitle}   [head ${hi}]`,
+      shape: `(T=${T}) × (d_k=${K})`,
+      rows: T, cols: K,
+      data: headSliceTHD(buf, T, h, K, hi),
+      mode: "signed",
+      rowLabels: tokenLabels, colLabels: dimLabels(K),
+    });
+
+    const specs = [
+      { matrixKey: "W_Q",
+        title: "W_Q   X[t] を Query 空間に射影する重み (preset で hand-crafted)",
+        shape: `(d_model=${D}) × (h*d_k=${HD})`,
+        rows: D, cols: HD, data: block0.W_Q, mode: "signed",
+        rowLabels: dimLabels(D), colLabels: colHeadLabels(HD) },
+    ];
+    for (let hi = 0; hi < h; hi++) {
+      specs.push(headSpec("Q", "Q = X · W_Q   各 token の「問い合わせ」", net.Q, hi));
+    }
+    specs.push({
+      matrixKey: "W_K",
+      title: "W_K   X[t] を Key 空間に射影する重み",
+      shape: `(d_model=${D}) × (h*d_k=${HD})`,
+      rows: D, cols: HD, data: block0.W_K, mode: "signed",
+      rowLabels: dimLabels(D), colLabels: colHeadLabels(HD),
+    });
+    for (let hi = 0; hi < h; hi++) {
+      specs.push(headSpec("K", "K = X · W_K   各 token の「ラベル」", net.K, hi));
+    }
+    specs.push({
+      matrixKey: "W_V",
+      title: "W_V   X[t] を Value 空間に射影する重み (Tier 2 では単位行列のまま)",
+      shape: `(d_model=${D}) × (h*d_k=${HD})`,
+      rows: D, cols: HD, data: block0.W_V, mode: "signed",
+      rowLabels: dimLabels(D), colLabels: colHeadLabels(HD),
+    });
+    for (let hi = 0; hi < h; hi++) {
+      specs.push(headSpec("V", "V = X · W_V   各 token が渡す「中身」", net.V, hi));
+    }
+    return specs;
+  }
+  if (tab === "attn") {
+    // Tier 2: scores / attn は head 別に並べる。
+    const h = net.h;
+    const specs = [];
+    for (let hi = 0; hi < h; hi++) {
+      specs.push({
+        matrixKey: `scores_h${hi}`,
+        title: `scores = (Q · Kᵀ) / √d_k   [head ${hi}]`,
+        shape: `(T=${T}) × (T=${T})`,
+        rows: T, cols: T,
+        data: headSliceHTT(net.scores, T, hi),
+        mode: "signed",
+        rowLabels: tokenLabels, colLabels: tokenLabels.slice(),
+      });
+      specs.push({
+        matrixKey: `attn_h${hi}`,
+        title: `attn = softmax(scores)   [head ${hi}]   (各行の和 = 1)`,
+        shape: `(T=${T}) × (T=${T})`,
+        rows: T, cols: T,
+        data: headSliceHTT(net.attn, T, hi),
+        mode: "attn",
+        rowLabels: tokenLabels, colLabels: tokenLabels.slice(),
+      });
+    }
+    return specs;
+  }
+  if (tab === "out") {
+    // Tier 2: attnOut は head 別、Y は concat·W_O、residual1 は X+Y、ln1_out は LN(residual1)。
+    const h = net.h;
+    const specs = [];
+    for (let hi = 0; hi < h; hi++) {
+      specs.push({
+        matrixKey: `attnOut_h${hi}`,
+        title: `attnOut = attn · V   [head ${hi}]`,
+        shape: `(T=${T}) × (d_k=${K})`,
+        rows: T, cols: K,
+        data: headSliceTHD(net.attnOut, T, h, K, hi),
+        mode: "signed",
+        rowLabels: tokenLabels, colLabels: dimLabels(K),
+      });
+    }
+    specs.push({
+      matrixKey: "Y",
+      title: "Y = concat(attnOut) · W_O   (Multi-Head Attention の射影出力)",
+      shape: `(T=${T}) × (d_model=${D})`,
+      rows: T, cols: D, data: net.Y, mode: "signed",
+      rowLabels: tokenLabels, colLabels: dimLabels(D),
+    });
+    specs.push({
+      matrixKey: "residual1",
+      title: "residual1 = X + Y   (残差接続: 元 token 情報を足し戻す)",
+      shape: `(T=${T}) × (d_model=${D})`,
+      rows: T, cols: D, data: net.residual1, mode: "signed",
+      rowLabels: tokenLabels, colLabels: dimLabels(D),
+    });
+    specs.push({
+      matrixKey: "ln1_out",
+      title: "ln1_out = LayerNorm(residual1, γ=1, β=0)   (Attention 部の出力、各行の mean=0 / std≈1)",
+      shape: `(T=${T}) × (d_model=${D})`,
+      rows: T, cols: D, data: net.ln1_out, mode: "signed",
+      rowLabels: tokenLabels, colLabels: dimLabels(D),
+    });
+    return specs;
+  }
+  if (tab === "ffn") {
+    // FFN タブ: 重み (W1, W2) + 中間活性 (ffn_h) + 出力 (ffn_out) + 残差/LN2 を縦に並べる。
+    const block0 = net.blocks[0];
+    const d_ff = net.d_ff;
+    const ffLabels = (n) => Array.from({ length: n }, (_, i) => `h${i}`);
+    return [
+      { matrixKey: "FFN_W1",
+        title: "W1   ln1_out を d_ff 次元の検出器空間に射影する重み (preset で hand-crafted)",
+        shape: `(d_model=${D}) × (d_ff=${d_ff})`,
+        rows: D, cols: d_ff, data: block0.FFN_W1, mode: "signed",
+        rowLabels: dimLabels(D), colLabels: ffLabels(d_ff) },
+      { matrixKey: "ffn_h",
+        title: "ffn_h = GELU(ln1_out · W1 + b1)   各 token の検出器ニューロン活性",
+        shape: `(T=${T}) × (d_ff=${d_ff})`,
+        rows: T, cols: d_ff, data: net.ffn_h, mode: "signed",
+        rowLabels: tokenLabels, colLabels: ffLabels(d_ff) },
+      { matrixKey: "FFN_W2",
+        title: "W2   検出器活性を d_model に書き戻す重み",
+        shape: `(d_ff=${d_ff}) × (d_model=${D})`,
+        rows: d_ff, cols: D, data: block0.FFN_W2, mode: "signed",
+        rowLabels: ffLabels(d_ff), colLabels: dimLabels(D) },
+      { matrixKey: "ffn_out",
+        title: "ffn_out = ffn_h · W2 + b2   FFN の出力",
+        shape: `(T=${T}) × (d_model=${D})`,
+        rows: T, cols: D, data: net.ffn_out, mode: "signed",
+        rowLabels: tokenLabels, colLabels: dimLabels(D) },
+      { matrixKey: "residual2",
+        title: "residual2 = ln1_out + ffn_out   2 回目の残差接続",
+        shape: `(T=${T}) × (d_model=${D})`,
+        rows: T, cols: D, data: net.residual2, mode: "signed",
+        rowLabels: tokenLabels, colLabels: dimLabels(D) },
+      { matrixKey: "ln2_out",
+        title: "ln2_out = LayerNorm(residual2, γ=1, β=0)   block 最終出力",
+        shape: `(T=${T}) × (d_model=${D})`,
+        rows: T, cols: D, data: net.ln2_out, mode: "signed",
+        rowLabels: tokenLabels, colLabels: dimLabels(D) },
+    ];
+  }
+  return [];
+}
+
+/**
+ * 1 つの行列を SVG に描画。yTop から開始し、下端 / 右端の y, x を返す。
+ * view: clickハンドラ呼び出しと selection ハイライトに使う。
+ */
+function drawMatrix(parent, spec, yTop, view) {
+  const { matrixKey, title, shape, rows, cols, data, mode, rowLabels, colLabels } = spec;
+  const sel = view?.selection;
+  const isSelectedHere = sel && sel.matrix === matrixKey;
+
+  // タイトル
+  parent.appendChild(el(
+    "text",
+    { class: "matrix-label", x: 8, y: yTop + LAYOUT.matrixTitleH - 4 },
+    title,
+  ));
+  parent.appendChild(el(
+    "text",
+    {
+      class: "matrix-shape-label",
+      x: 8,
+      y: yTop + LAYOUT.matrixTitleH + LAYOUT.matrixShapeH - 4,
+    },
+    shape,
+  ));
+
+  // グリッドの起点
+  const gridLeft = 8 + LAYOUT.rowLabelW;
+  const gridTop = yTop + LAYOUT.matrixTitleH + LAYOUT.matrixShapeH + LAYOUT.colLabelH;
+
+  // 値の絶対値の最大 (signed モードの色スケール用)
+  let absMax = 0;
+  for (let i = 0; i < rows * cols; i++) {
+    const v = Math.abs(data[i]);
+    if (v > absMax) absMax = v;
+  }
+  if (absMax === 0) absMax = 1;  // 全 0 のとき 0 除算回避
+
+  // 列ヘッダ
+  for (let c = 0; c < cols; c++) {
+    parent.appendChild(el(
+      "text",
+      {
+        class: "col-label",
+        x: gridLeft + c * LAYOUT.cellW + LAYOUT.cellW / 2,
+        y: gridTop - 4,
+      },
+      colLabels[c],
+    ));
+  }
+
+  // 各行
+  for (let r = 0; r < rows; r++) {
+    const cellY = gridTop + r * LAYOUT.cellH;
+    // 行ラベル
+    parent.appendChild(el(
+      "text",
+      {
+        class: "row-label",
+        x: gridLeft - 6,
+        y: cellY + LAYOUT.cellH / 2 + 4,
+      },
+      rowLabels[r],
+    ));
+    // セル
+    for (let c = 0; c < cols; c++) {
+      const cellX = gridLeft + c * LAYOUT.cellW;
+      const v = data[r * cols + c];
+      const fill = mode === "attn"
+        ? attnFill(v)
+        : signedFill(v, absMax);
+      const isSelected = isSelectedHere && sel.row === r && sel.col === c;
+      const cellClass = "cell-rect" + (isSelected ? " cell-selected" : "");
+      const rect = el("rect", {
+        class: cellClass,
+        x: cellX, y: cellY,
+        width: LAYOUT.cellW, height: LAYOUT.cellH,
+        fill,
+        "data-row": r, "data-col": c, "data-matrix": matrixKey,
+      });
+      // セルクリック → 選択 + handlers.onCellClick
+      if (view && matrixKey) {
+        rect.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          view.handlers?.onCellClick?.({ matrix: matrixKey, row: r, col: c });
+        });
+        // ドラッグ pan を妨げないよう、ホバー時はカーソル変更だけ。
+        rect.style.cursor = "pointer";
+      }
+      parent.appendChild(rect);
+      // セル内の数値
+      const textClass = mode === "attn"
+        ? (v >= 0.5 ? "cell-text attn-cell-text dark" : "cell-text attn-cell-text")
+        : "cell-text";
+      const txt = el("text", {
+        class: textClass,
+        x: cellX + LAYOUT.cellW / 2,
+        y: cellY + LAYOUT.cellH / 2 + 1,
+      }, formatCellValue(v, mode));
+      txt.style.pointerEvents = "none";
+      parent.appendChild(txt);
+    }
+  }
+
+  const bottomY = gridTop + rows * LAYOUT.cellH;
+  const rightX = gridLeft + cols * LAYOUT.cellW;
+  return { bottomY, rightX };
+}
+
+function formatCellValue(v, mode) {
+  if (!Number.isFinite(v)) return String(v);
+  if (mode === "attn") return v.toFixed(2);
+  // signed: 符号付き 3 桁
+  const s = v.toFixed(3);
+  return v >= 0 ? `+${s}` : s;
+}
+
+/**
+ * signed モードのセル色 (青=負、白=0、赤=正、明度 = |v| / absMax)。
+ */
+function signedFill(v, absMax) {
+  const t = Math.min(1, Math.abs(v) / absMax);  // 0..1
+  // 透明度で表現するのは縞模様になるので、白から色へ補間
+  if (v >= 0) {
+    // 白 → 赤 (#c53030)
+    const r = Math.round(255 - (255 - 197) * t);
+    const g = Math.round(255 - (255 - 48) * t);
+    const b = Math.round(255 - (255 - 48) * t);
+    return `rgb(${r},${g},${b})`;
+  } else {
+    // 白 → 青 (#2b6cb0)
+    const r = Math.round(255 - (255 - 43) * t);
+    const g = Math.round(255 - (255 - 108) * t);
+    const b = Math.round(255 - (255 - 176) * t);
+    return `rgb(${r},${g},${b})`;
+  }
+}
+
+/**
+ * attn モードのセル色 (白=0、青濃=1)。0..1 の値を期待。
+ */
+function attnFill(v) {
+  const t = Math.max(0, Math.min(1, v));
+  const r = Math.round(255 - (255 - 43) * t);
+  const g = Math.round(255 - (255 - 108) * t);
+  const b = Math.round(255 - (255 - 176) * t);
+  return `rgb(${r},${g},${b})`;
+}
+
+// ─── pan / zoom ────────────────────────────────────────────
+
+function installPanZoom(view) {
+  const svg = view.svg;
+  let dragging = false;
+  let lastClientX = 0, lastClientY = 0;
+
+  svg.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
+    dragging = true;
+    lastClientX = ev.clientX;
+    lastClientY = ev.clientY;
+    svg.classList.add("dragging");
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (dragging) {
+      dragging = false;
+      svg.classList.remove("dragging");
+    }
+  });
+
+  window.addEventListener("mousemove", (ev) => {
+    if (!dragging) return;
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    // 1 px の DOM 移動 = (viewBox.w / rect.width) ユニットの SVG 移動
+    const dx = (ev.clientX - lastClientX) * (view.viewBox.w / rect.width);
+    const dy = (ev.clientY - lastClientY) * (view.viewBox.h / rect.height);
+    view.viewBox.x -= dx;
+    view.viewBox.y -= dy;
+    lastClientX = ev.clientX;
+    lastClientY = ev.clientY;
+    applyViewBox(view);
+  });
+
+  svg.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+
+    // ホイール方向: 正 = ズームアウト (= viewBox.w 拡大)、負 = ズームイン
+    const factor = ev.deltaY > 0 ? 1.15 : 1 / 1.15;
+
+    // マウス位置を中心にズーム
+    const mx = (ev.clientX - rect.left) / rect.width;   // 0..1
+    const my = (ev.clientY - rect.top) / rect.height;   // 0..1
+    const targetX = view.viewBox.x + mx * view.viewBox.w;
+    const targetY = view.viewBox.y + my * view.viewBox.h;
+
+    const newW = view.viewBox.w * factor;
+    const newH = view.viewBox.h * factor;
+    view.viewBox.x = targetX - mx * newW;
+    view.viewBox.y = targetY - my * newH;
+    view.viewBox.w = newW;
+    view.viewBox.h = newH;
+    applyViewBox(view);
+  }, { passive: false });
+}
+
+
+// ---------- explain.js ----------
+
+// explain.js — 「式の展開」HTML テンプレート。
+// 設計書 §7.3 に対応。MLP 版 v1 の哲学を継承し、
+// [段1] 一般形 → [段2] 当てはめ → [段3] 数値 の 3 段板書を作る。
+//
+// 引数: state = { net, selection: { matrix, row, col } }
+//   matrix は文字列キー: preset 由来の重み行列 ("W_E" | "W_P" | "W_Q" | "W_K" | "W_V")
+//                        または forward 由来の中間値 ("X" | "Q" | "K" | "V" | "scores" | "attn" | "attnOut" | "Y")
+//
+// 戻り値: HTML 文字列 (controller.js が ui.explainBody.innerHTML に流し込む)。
+
+// ─── 数式レンダリング用ヘルパ ─────────────────────────────
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Lesson 文中で使う、ごく軽量な markdown 風変換 + HTML エスケープ。
+ *   1. まず HTML エスケープ
+ *   2. その上で **xxx** を <b>xxx</b> に置換 (太字強調)
+ * 改行は CSS の white-space: pre-line で処理する想定なので、ここでは触らない。
+ */
+function escapeAndBold(s) {
+  return escapeHtml(s).replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+}
+
+// 変数 (italic) + subscript + superscript
+function mv(name, sub, sup) {
+  const n = `<i>${escapeHtml(name)}</i>`;
+  const sb = (sub != null && sub !== "") ? `<sub>${escapeHtml(sub)}</sub>` : "";
+  const sp = (sup != null && sup !== "") ? `<sup>${escapeHtml(sup)}</sup>` : "";
+  return n + sb + sp;
+}
+function mn(v)  { return `<span class="mnum">${escapeHtml(v)}</span>`; }
+function mo(op) { return `<span class="mop">${escapeHtml(op)}</span>`; }
+function mline(html)        { return `<div class="line">${html}</div>`; }
+function mblock(...lines)   { return `<div class="math">${lines.join("")}</div>`; }
+
+function fmt(v, digits = 3) {
+  if (!Number.isFinite(v)) return String(v);
+  return (v >= 0 ? "+" : "") + v.toFixed(digits);
+}
+function fmtAttn(v, digits = 3) {
+  if (!Number.isFinite(v)) return String(v);
+  return v.toFixed(digits);
+}
+
+// 「T2 美しい」のようなラベル。token id→単語。
+function tokenLabel(net, t) {
+  const word = net.vocab[net.tokens[t]] ?? "?";
+  return `T${t} ${word}`;
+}
+
+// ─── エントリポイント ─────────────────────────────────────
+
+function renderExplainHtml(state) {
+  const sel = state?.selection;
+  if (!sel) {
+    return `
+      <p class="muted">
+        中央パネルの行列のセルをクリックすると、ここにそのセルの計算式が
+        [段1] 一般形 → [段2] 当てはめ → [段3] 数値 の 3 段で展開されます。
+      </p>`;
+  }
+  const { net } = state;
+  if (!net) return "";
+
+  const phase = net.phase ?? "idle";
+  // 行列キー正規化: "Q_h0" → { name: "Q", head: 0 }、"Q" → { name: "Q", head: null }
+  const { name, head } = parseMatrixKey(sel.matrix);
+
+  // forward 前でも見られる行列: 入力埋め込み X (precomputed) と preset 由来の重み行列。
+  const PRESET_OK_AT_IDLE = new Set([
+    "X", "W_E", "W_P", "W_Q", "W_K", "W_V", "FFN_W1", "FFN_W2",
+  ]);
+  if (phase === "idle" && !PRESET_OK_AT_IDLE.has(name)) {
+    return `
+      <p class="muted">
+        ${escapeHtml(sel.matrix)}[${sel.row},${sel.col}] はまだ Forward が実行されていません。
+        上部の <b>Forward</b> ボタンを押してから再度クリックしてください。
+      </p>`;
+  }
+
+  switch (name) {
+    case "W_E":     return renderWE(net, sel);
+    case "W_P":     return renderWP(net, sel);
+    case "W_Q":     return renderProjectionWeight(net, sel, "Q");
+    case "W_K":     return renderProjectionWeight(net, sel, "K");
+    case "W_V":     return renderProjectionWeight(net, sel, "V");
+    case "X":       return renderEmbed(net, sel);
+    case "Q":       return renderQKV(net, sel, "Q", head);
+    case "K":       return renderQKV(net, sel, "K", head);
+    case "V":       return renderQKV(net, sel, "V", head);
+    case "scores":  return renderScores(net, sel, head);
+    case "attn":    return renderAttn(net, sel, head);
+    case "attnOut": return renderAttnOut(net, sel, head);
+    case "Y":       return renderY(net, sel);
+    case "residual1": return renderResidual1(net, sel);
+    case "ln1_out":   return renderLN1(net, sel);
+    case "FFN_W1":    return renderFFNWeight(net, sel, "W1");
+    case "FFN_W2":    return renderFFNWeight(net, sel, "W2");
+    case "ffn_h":     return renderFFNHidden(net, sel);
+    case "ffn_out":   return renderFFNOut(net, sel);
+    case "residual2": return renderResidual2(net, sel);
+    case "ln2_out":   return renderLN2(net, sel);
+    default:
+      return `<p class="muted">未対応の行列: ${escapeHtml(sel.matrix)}</p>`;
+  }
+}
+
+/** "Q_h0" → { name: "Q", head: 0 }、"Q" → { name: "Q", head: null } */
+function parseMatrixKey(key) {
+  const m = /^([A-Za-z_]+)_h(\d+)$/.exec(key);
+  if (m) return { name: m[1], head: parseInt(m[2], 10) };
+  return { name: key, head: null };
+}
+
+// ─── 各行列の式展開 ────────────────────────────────────────
+
+function renderThreeStep(title, s1, s2, s3, note = "") {
+  return `
+    <div class="explain-section">
+      <h4>${escapeHtml(title)}</h4>
+      <h4 class="step-h">[段1] 一般形</h4>${s1}
+      <h4 class="step-h">[段2] 当てはめ</h4>${s2}
+      <h4 class="step-h">[段3] 数値</h4>${s3}
+      ${note}
+    </div>`;
+}
+
+// W_E[token_id, d] のセル — token 埋め込み (位置に依存しない)
+function renderWE(net, sel) {
+  const { row: t, col: d } = sel;  // ここでの row は (現在表示中の) token 位置
+  const tokenId = net.tokens[t];
+  const word = net.vocab[tokenId];
+  const we = net.W_E[tokenId * net.d_model + d];
+
+  const s1 = mblock(mline(
+    `${mv("W_E", "id,d")} <span class="comment">  (id = ${escapeHtml(word)} の vocab id)</span>`
+  ));
+  const s2 = mblock(mline(
+    `${mv("W_E")}${mo("[")}id=${tokenId} (${escapeHtml(word)})${mo(",")} d${d}${mo("]")}`
+  ));
+  const s3 = mblock(mline(
+    `${mv("W_E")}${mo("[")}id=${tokenId}${mo(",")} d${d}${mo("]")} ${mo("=")} ${mn(fmt(we))}`
+  ));
+  return renderThreeStep(
+    `W_E (token 埋め込み) — 位置とは無関係`,
+    s1, s2, s3,
+    `<p class="muted note">※ W_E は preset で hand-crafted (=「猫」は dim 0 (is_noun) と dim 9 (サイズ特徴) に値を持つ、など意味が割り当ててある)。設計書 §6.9.2 の表を参照。同じ token は位置 t によらず常に同じ W_E ベクトルを返す。</p>`,
+  );
+}
+
+// W_P[t, d] のセル — 位置エンコーディング (token と無関係)
+function renderWP(net, sel) {
+  const { row: t, col: d } = sel;
+  const wp = net.W_P[t * net.d_model + d];
+  const isEven = (d % 2 === 0);
+  const i = Math.floor(d / 2);          // 偶数 dim 2i / 奇数 dim 2i+1 の i
+  const power = (2 * i) / net.d_model;  // 10000^(2i/d_model) の指数
+  const base = Math.pow(10000, power);
+  const theta = t / base;
+  const fnName = isEven ? "sin" : "cos";
+
+  const s1 = mblock(mline(
+    isEven
+      ? `${mv("W_P", "t,2i")} ${mo("=")} ${mv("sin")}${mo("(")}t ${mo("/")} 10000<sup>2i/d_model</sup>${mo(")")}`
+      : `${mv("W_P", "t,2i+1")} ${mo("=")} ${mv("cos")}${mo("(")}t ${mo("/")} 10000<sup>2i/d_model</sup>${mo(")")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("W_P")}${mo("[")}t=${t}${mo(",")} d=${d}${mo("]")} ${mo("=")} ${mv(fnName)}${mo("(")}` +
+    `${t} ${mo("/")} 10000<sup>${(2 * i)}/${net.d_model}</sup>${mo(")")}`
+  ));
+  const s3 = mblock(
+    mline(`10000<sup>${(2 * i)}/${net.d_model}</sup> ${mo("=")} ${mn(base.toFixed(4))}`),
+    mline(`${t} ${mo("/")} ${mn(base.toFixed(4))} ${mo("=")} ${mn(theta.toFixed(4))}`),
+    mline(`${mv(fnName)}${mo("(")}${mn(theta.toFixed(4))}${mo(")")} ${mo("=")} ${mn(fmt(wp))}`),
+  );
+  return renderThreeStep(
+    `W_P (位置エンコーディング) — token と無関係に位置 t だけで決まる`,
+    s1, s2, s3,
+    `<p class="muted note">※ 偶数 dim には sin、奇数 dim には cos を使う。dim が大きいほど周期が長い (10000<sup>2i/d_model</sup> が大きくなる)。学習せず固定値。同じ位置 t なら、どの token のときでも W_P は完全に同じ値。</p>`,
+  );
+}
+
+// W_Q / W_K / W_V[in d, out k] のセル — 射影行列の 1 要素。
+// 行 i = 入力 dim (X 側)、列 j = 出力 dim (Q/K/V 側)。preset で hand-crafted。
+function renderProjectionWeight(net, sel, which) {
+  const { row: inD, col: outG } = sel;
+  const HD = net.h * net.d_k;
+  const W = (which === "Q") ? net.blocks[0].W_Q
+          : (which === "K") ? net.blocks[0].W_K
+          :                   net.blocks[0].W_V;
+  const w = W[inD * HD + outG];
+  const matName = `W_${which}`;
+  const outName = which;
+  const hi = Math.floor(outG / net.d_k);
+  const localK = outG % net.d_k;
+
+  const dimMeaning = INPUT_DIM_MEANING[inD] ?? `dim ${inD}`;
+  const bondMeaning = BOND_MEANING[outG] ?? `head ${hi} の col ${localK}`;
+
+  const s1 = mblock(mline(
+    `${mv(matName, "inD, outG")} <span class="comment">  (= 入力 dim inD の値を、出力 col outG = h${hi}.d${localK} にどれだけ流すか)</span>`
+  ));
+  const s2 = mblock(mline(
+    `${mv(matName)}${mo("[")}d${inD}${mo(",")} g${outG}${mo("]")} <span class="comment">  (g${outG} = h${hi}·d_k + d${localK})</span>`
+  ));
+  const s3 = mblock(mline(
+    `${mv(matName)}${mo("[")}d${inD}${mo(",")} g${outG}${mo("]")} ${mo("=")} ${mn(fmt(w))}`
+  ));
+
+  let note = "";
+  if (which === "V") {
+    note = `<p class="muted note">※ 本シミュレータの W_V は単位行列 (対角だけ +1.000、他は 0)。つまり V = X となり、Value 経路は「埋め込みベクトルそのままを後段に渡す」教育的設計を採っている。</p>`;
+  } else {
+    const role = (which === "Q")
+      ? "Query (= 各 token が「どんな相手を見たいか」の問い合わせ) を作る"
+      : "Key   (= 各 token が「自分はこう参照される」と差し出すラベル) を作る";
+    const interp = (Math.abs(w) > 1e-9)
+      ? `→ X[t, d${inD}] (= ${escapeHtml(dimMeaning)}) が ${outName}[t, h${hi}, d${localK}] (= ${escapeHtml(bondMeaning)}) に係数 ${fmt(w)} で流れ込む。`
+      : `→ X[t, d${inD}] (= ${escapeHtml(dimMeaning)}) は ${outName}[t, h${hi}, d${localK}] には寄与しない (このパスは preset で閉じている)。`;
+    note = `<p class="muted note">※ ${escapeHtml(matName)} は X を ${role} 重み行列。preset では「各文法カテゴリの dim」を「特定の bond の global col」に流すよう hand-crafted。${interp}</p>`;
+  }
+
+  return renderThreeStep(
+    `${matName} (X → ${outName} 射影の 1 要素) — preset 由来の固定値`,
+    s1, s2, s3,
+    note,
+  );
+}
+
+// preset §6.9 の dim 設計 (W_Q/W_K の解釈用)
+const INPUT_DIM_MEANING = {
+  0: "is_noun (名詞カテゴリ)",
+  1: "is_adjective (形容詞カテゴリ)",
+  2: "is_pronoun (指示詞カテゴリ)",
+  3: "is_predicate (述語カテゴリ)",
+  8: "美しさ特徴",
+  9: "サイズ特徴",
+  10: "書物特徴",
+  11: "人気度特徴",
+};
+// bond は Q → K の一方向。Tier 2 では bond は global col で識別。
+// bond 0/1 = head 0 (cols 0,1)、bond 2 = head 1 (col 8)。
+const BOND_MEANING = {
+  0: "bond 0 = 形容詞 (Q) → 名詞 (K)  [head 0]",
+  1: "bond 1 = 指示詞 (Q) → 名詞 (K)  [head 0]",
+  8: "bond 2 = 述語 (Q) → 名詞 (K)  [head 1]",
+};
+
+// X[t, d] = W_E[token[t], d] + W_P[t, d]
+function renderEmbed(net, sel) {
+  const { row: t, col: d } = sel;
+  const tokenId = net.tokens[t];
+  const word = net.vocab[tokenId];
+  const we = net.W_E[tokenId * net.d_model + d];
+  const wp = net.W_P[t * net.d_model + d];
+  const x = net.X[t * net.d_model + d];
+
+  const s1 = mblock(mline(
+    `${mv("X", "t,d")} ${mo("=")} ${mv("W_E", "token[t],d")} ${mo("+")} ${mv("W_P", "t,d")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("X")}${mo("[")}${tokenLabel(net, t)}${mo(",")} d${d}${mo("]")} ${mo("=")} ` +
+    `${mv("W_E")}${mo("[")}id=${tokenId} (${word})${mo(",")} d${d}${mo("]")} ${mo("+")} ` +
+    `${mv("W_P")}${mo("[")}t=${t}${mo(",")} d${d}${mo("]")}`
+  ));
+  const s3 = mblock(mline(
+    `${mn(fmt(we))} ${mo("+")} ${mn(fmt(wp))} ${mo("=")} ${mn(fmt(x))}`
+  ));
+  return renderThreeStep(
+    `Embed (X) — トークン埋め込み + 位置エンコーディング`,
+    s1, s2, s3,
+    `<p class="muted note">※ W_E は token id ごとの埋め込み (hand-crafted)、W_P は固定の sin/cos 位置エンコーディング。</p>`,
+  );
+}
+
+// Q[t, hi, k] = sum_d X[t, d] · W_?[d, hi*d_k + k]   (Tier 2: Multi-Head)
+// view.js は head ごとに (T, d_k) を表示するので、sel.col は head 内ローカル col k。
+// 重み W_? の global col は hi * d_k + k (= W のグローバル列 g) になる。
+function renderQKV(net, sel, which, headIdx) {
+  const { row: t, col: k } = sel;
+  const D = net.d_model;
+  const d_k = net.d_k;
+  const h = net.h;
+  const hi = (headIdx == null) ? 0 : headIdx;
+  const g = hi * d_k + k;  // global col index (W_Q / Q_full の列)
+  const W = (which === "Q") ? net.blocks[0].W_Q
+          : (which === "K") ? net.blocks[0].W_K
+          : net.blocks[0].W_V;
+  const out = (which === "Q") ? net.Q
+            : (which === "K") ? net.K
+            : net.V;
+  const v = out[t * h * d_k + hi * d_k + k];
+
+  const s1 = mblock(mline(
+    `${mv(which, "t,hi,k")} ${mo("=")} ${mv("Σ", "d")} ${mv("X", "t,d")} ${mo("·")} ` +
+    `${mv(`W_${which}`, "d, hi·d_k+k")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv(which)}${mo("[")}${tokenLabel(net, t)}${mo(",")} h${hi}${mo(",")} d${k}${mo("]")} ${mo("=")} ` +
+    `${mv("Σ", "d")} ${mv("X")}${mo("[")}t=${t}${mo(",")} d${mo("]")} ${mo("·")} ` +
+    `${mv(`W_${which}`)}${mo("[")}d${mo(",")} g=${g}${mo("]")} <span class="comment">  (g = h${hi}·d_k + d${k} = ${g})</span>`
+  ));
+
+  // [段3] 数値展開: 0 でない項のみ抽出
+  const lines = [];
+  let total = 0;
+  for (let d = 0; d < D; d++) {
+    const x  = net.X[t * D + d];
+    const wd = W[d * h * d_k + g];
+    const prod = x * wd;
+    total += prod;
+    if (Math.abs(wd) < 1e-9) continue;
+    lines.push(
+      `${mv("X")}${mo("[")}t,${d}${mo("]")} ${mo("·")} ${mv(`W_${which}`)}${mo("[")}${d},g${g}${mo("]")} ${mo("=")} ` +
+      `${mn(fmt(x))} ${mo("·")} ${mn(fmt(wd))} ${mo("=")} ${mn(fmt(prod))}`
+    );
+  }
+  if (lines.length === 0) {
+    lines.push(
+      `<span class="comment"># すべての項で W_${which}[d, g${g}] = 0 のため寄与なし</span>`
+    );
+  }
+  lines.push(
+    `${mv(which)}${mo("[")}${tokenLabel(net, t)}${mo(",")} h${hi}${mo(",")} d${k}${mo("]")} ${mo("=")} ${mn(fmt(total))}`
+  );
+  const s3 = mblock(...lines.map(mline));
+
+  const intent = which === "Q" ? "Query (このトークンが「何を見たいか」)"
+              : which === "K" ? "Key   (このトークンが「何として参照されるか」)"
+              : "Value (このトークンが「何を持ち寄るか」)";
+  return renderThreeStep(
+    `${which} — ${intent}   [head ${hi}]`,
+    s1, s2, s3,
+    `<p class="muted note">※ W_${which} は preset で hand-crafted。head ${hi} に割り当てられた cols (global g = ${hi * d_k}..${hi * d_k + d_k - 1}) のうち、bond 配線が立っている col だけ非ゼロが出る。</p>`,
+  );
+}
+
+// scores[i, j] = (Q[i, :] · K[j, :]) / sqrt(d_k)
+function renderScores(net, sel, headIdx) {
+  const { row: i, col: j } = sel;
+  const T = net.T;
+  const d_k = net.d_k;
+  const h = net.h;
+  const hi = (headIdx == null) ? 0 : headIdx;
+  const score = net.scores[hi * T * T + i * T + j];
+  const sqrtDk = Math.sqrt(d_k);
+
+  const s1 = mblock(mline(
+    `${mv("scores", "hi,i,j")} ${mo("=")} ${mo("(")}${mv("Q", "i,hi,:")} ${mo("·")} ${mv("K", "j,hi,:")}${mo(")")} ${mo("/")} ${mv("√d_k")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("scores")}${mo("[")}h${hi}, ${tokenLabel(net, i)} → ${tokenLabel(net, j)}${mo("]")} ${mo("=")} ` +
+    `${mo("(")}${mv("Σ", "k")} ${mv("Q")}${mo("[")}i,h${hi},k${mo("]")} ${mo("·")} ` +
+    `${mv("K")}${mo("[")}j,h${hi},k${mo("]")}${mo(")")} ${mo("/")} ${mn(sqrtDk.toFixed(3))}`
+  ));
+
+  // [段3]: 0 でない項を出す。head 内 (T, d_k) のオフセット計算
+  const qBase = i * h * d_k + hi * d_k;
+  const kBase = j * h * d_k + hi * d_k;
+  const lines = [];
+  let dot = 0;
+  for (let k = 0; k < d_k; k++) {
+    const q = net.Q[qBase + k];
+    const kk = net.K[kBase + k];
+    const prod = q * kk;
+    dot += prod;
+    if (Math.abs(prod) < 1e-9) continue;
+    lines.push(
+      `${mv("Q")}${mo("[i,h")}${hi}${mo(",")}${k}${mo("]")} ${mo("·")} ${mv("K")}${mo("[j,h")}${hi}${mo(",")}${k}${mo("]")} ${mo("=")} ` +
+      `${mn(fmt(q))} ${mo("·")} ${mn(fmt(kk))} ${mo("=")} ${mn(fmt(prod))}`
+    );
+  }
+  if (lines.length === 0) {
+    lines.push(`<span class="comment"># Q · K のすべての項で 0 (= score = 0)</span>`);
+  }
+  lines.push(
+    `${mv("Q")} ${mo("·")} ${mv("K")} ${mo("=")} ${mn(fmt(dot))}`
+  );
+  lines.push(
+    `${mv("scores")} ${mo("=")} ${mn(fmt(dot))} ${mo("/")} ${mn(sqrtDk.toFixed(3))} ${mo("=")} ${mn(fmt(score))}`
+  );
+  const s3 = mblock(...lines.map(mline));
+
+  const qkExcerpt = renderQKExcerpt(net, i, j, hi);
+
+  return renderThreeStep(
+    `scores — Attention スコア (内積 / √d_k)   [head ${hi}]`,
+    s1, s2, s3,
+    qkExcerpt +
+    `<p class="muted note">※ √d_k = √${d_k} で割るのは d_k が大きいときに softmax が極端化しないためのスケーリング (元論文 §3.2.1)。Multi-Head の場合は各 head の d_k で割る。</p>`,
+  );
+}
+
+// scores[hi, i, j] のセルクリック時に出す「Q[i, hi] と K[j, hi] の関連 dim 抜粋」表。
+function renderQKExcerpt(net, i, j, hi) {
+  const d_k = net.d_k;
+  const h = net.h;
+  const qBase = i * h * d_k + hi * d_k;
+  const kBase = j * h * d_k + hi * d_k;
+  const cols = [];
+  for (let k = 0; k < d_k; k++) {
+    const q = net.Q[qBase + k];
+    const kk = net.K[kBase + k];
+    if (Math.abs(q) > 1e-9 || Math.abs(kk) > 1e-9) {
+      cols.push({ k, q, kk, prod: q * kk });
+    }
+  }
+  if (cols.length === 0) {
+    return `<p class="muted note">※ 関連 dim 抜粋: Q[${tokenLabel(net, i)}, h${hi}] も K[${tokenLabel(net, j)}, h${hi}] も全 dim で 0 のため、scores も 0。</p>`;
+  }
+  const head = `<th>dim</th>` + cols.map(c => `<th>h${hi}.d${c.k}</th>`).join("");
+  const qRow = `<th>Q[i]</th>` + cols.map(c => `<td>${fmt(c.q)}</td>`).join("");
+  const kRow = `<th>K[j]</th>` + cols.map(c => `<td>${fmt(c.kk)}</td>`).join("");
+  const pRow = `<th>Q·K</th>` + cols.map(c => `<td>${fmt(c.prod)}</td>`).join("");
+  return `
+    <div class="qk-excerpt">
+      <p class="qk-excerpt-cap">関連セル抜粋: head ${hi}, i = ${escapeHtml(tokenLabel(net, i))}, j = ${escapeHtml(tokenLabel(net, j))} (Q または K が 0 でない dim だけ)</p>
+      <table class="qk-pair-table">
+        <thead><tr>${head}</tr></thead>
+        <tbody>
+          <tr>${qRow}</tr>
+          <tr>${kRow}</tr>
+          <tr class="qk-prod-row">${pRow}</tr>
+        </tbody>
+      </table>
+    </div>`;
+}
+
+// attn[hi, i, j] = softmax(scores[hi, i, :])[j]   (Tier 2: per-head softmax)
+function renderAttn(net, sel, headIdx) {
+  const { row: i, col: j } = sel;
+  const T = net.T;
+  const hi = (headIdx == null) ? 0 : headIdx;
+  const sBase = hi * T * T;
+  const a = net.attn[sBase + i * T + j];
+  const score_ij = net.scores[sBase + i * T + j];
+
+  const s1 = mblock(mline(
+    `${mv("attn", "hi,i,j")} ${mo("=")} ${mv("softmax")}${mo("(")}${mv("scores", "hi,i,:")}${mo(")")}${mo("[")}j${mo("]")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("attn")}${mo("[")}h${hi}, ${tokenLabel(net, i)} → ${tokenLabel(net, j)}${mo("]")} ` +
+    `${mo("=")} ${mv("e")}<sup>${fmt(score_ij)}</sup> ${mo("/")} ` +
+    `${mv("Σ", "j'")} ${mv("e")}<sup>scores[h${hi}, i, j']</sup>`
+  ));
+
+  // [段3] 数値: 各 j' について exp(score) と総和 (head 内のみ)
+  let m = -Infinity;
+  for (let jp = 0; jp < T; jp++) {
+    const s = net.scores[sBase + i * T + jp];
+    if (s > m) m = s;
+  }
+  let sum = 0;
+  const lines3 = [];
+  for (let jp = 0; jp < T; jp++) {
+    const s = net.scores[sBase + i * T + jp];
+    const e = Math.exp(s - m);
+    sum += e;
+    lines3.push(
+      `${mv("e")}<sup>${fmt(s)} − max</sup> ` +
+      `${mo("=")} ${mn(e.toFixed(4))} <span class="comment">  (${tokenLabel(net, jp)} に対する重み素材)</span>`
+    );
+  }
+  lines3.push(
+    `${mv("Σ")} ${mo("=")} ${mn(sum.toFixed(4))}`
+  );
+  lines3.push(
+    `${mv("attn")}${mo("[")}h${hi}, i, j${mo("]")} ${mo("=")} ${mv("e")}<sup>${fmt(score_ij)} − max</sup> / ${mn(sum.toFixed(4))} ${mo("=")} ${mn(fmtAttn(a, 4))}`
+  );
+  const s3 = mblock(...lines3.map(mline));
+
+  return renderThreeStep(
+    `attn — Softmax 後の注目度   [head ${hi}]   (各行の和 = 1)`,
+    s1, s2, s3,
+    `<p class="muted note">※ 数値安定化のため、各 head の各行の max を引いてから exp を計算 (overflow 防止)。値の比率は不変。Multi-Head の softmax は head 内で独立に行う。</p>`,
+  );
+}
+
+// attnOut[t, hi, k] = sum_j(attn[hi, t, j] · V[j, hi, k])   (Tier 2: per-head)
+function renderAttnOut(net, sel, headIdx) {
+  const { row: i, col: k } = sel;
+  const T = net.T;
+  const d_k = net.d_k;
+  const h = net.h;
+  const hi = (headIdx == null) ? 0 : headIdx;
+  const v = net.attnOut[i * h * d_k + hi * d_k + k];
+  const aBase = hi * T * T + i * T;
+
+  const s1 = mblock(mline(
+    `${mv("attnOut", "t,hi,k")} ${mo("=")} ${mv("Σ", "j")} ${mv("attn", "hi,t,j")} ${mo("·")} ${mv("V", "j,hi,k")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("attnOut")}${mo("[")}${tokenLabel(net, i)}, h${hi}, d${k}${mo("]")} ${mo("=")} ` +
+    `${mv("Σ", "j")} ${mv("attn")}${mo("[")}h${hi}, i, j${mo("]")} ${mo("·")} ${mv("V")}${mo("[")}j, h${hi}, ${k}${mo("]")}`
+  ));
+
+  const lines = [];
+  let total = 0;
+  for (let j = 0; j < T; j++) {
+    const a = net.attn[aBase + j];
+    const vj = net.V[j * h * d_k + hi * d_k + k];
+    const prod = a * vj;
+    total += prod;
+    lines.push(
+      `${mn(fmtAttn(a, 3))} ${mo("·")} ${mn(fmt(vj))} ${mo("=")} ${mn(fmt(prod))} ` +
+      `<span class="comment">  (${tokenLabel(net, j)} の V から)</span>`
+    );
+  }
+  lines.push(
+    `${mv("attnOut")}${mo("[")}t, h${hi}, k${mo("]")} ${mo("=")} ${mn(fmt(total))}`
+  );
+  const s3 = mblock(...lines.map(mline));
+
+  return renderThreeStep(
+    `attnOut — Attention で集約した V   [head ${hi}]`,
+    s1, s2, s3,
+    `<p class="muted note">※ 各 j について attn と V の積を合計。attn が大きい j (= 注目しているトークン) の V の寄与が大きくなる。各 head 独立に集約し、最後に concat して W_O で射影する。</p>`,
+  );
+}
+
+// Y[i, d] = sum_g concat(attnOut)[i, g] · W_O[g, d]   (Tier 2: g は h*d_k 軸)
+function renderY(net, sel) {
+  const { row: i, col: d } = sel;
+  const HD = net.h * net.d_k;  // = d_model
+  const W_O = net.blocks[0].W_O;
+  const y = net.Y[i * net.d_model + d];
+
+  const s1 = mblock(mline(
+    `${mv("Y", "i,d")} ${mo("=")} ${mv("Σ", "g")} ${mv("attnOut_concat", "i,g")} ${mo("·")} ${mv("W_O", "g,d")} ` +
+    `<span class="comment">  (g は head 軸を flatten した index)</span>`
+  ));
+  const s2 = mblock(mline(
+    `${mv("Y")}${mo("[")}${tokenLabel(net, i)}${mo(",")} d${d}${mo("]")} ${mo("=")} ` +
+    `${mv("Σ", "g")} ${mv("attnOut_concat")}${mo("[")}i, g${mo("]")} ${mo("·")} ${mv("W_O")}${mo("[")}g, ${d}${mo("]")}`
+  ));
+
+  const lines = [];
+  let total = 0;
+  // attnOut の (T, h*d_k) 配置は net.attnOut[i * HD + g] でアクセスできる。
+  for (let g = 0; g < HD; g++) {
+    const a = net.attnOut[i * HD + g];
+    const w = W_O[g * net.d_model + d];
+    const prod = a * w;
+    total += prod;
+    if (Math.abs(w) < 1e-9) continue;
+    const hi = Math.floor(g / net.d_k);
+    const k  = g % net.d_k;
+    lines.push(
+      `${mn(fmt(a))} ${mo("·")} ${mn(fmt(w))} ${mo("=")} ${mn(fmt(prod))} ` +
+      `<span class="comment">  (g${g} = h${hi}.d${k})</span>`
+    );
+  }
+  if (lines.length === 0) {
+    lines.push(`<span class="comment"># W_O[g,d] が全て 0 のため寄与なし</span>`);
+  }
+  lines.push(`${mv("Y")} ${mo("=")} ${mn(fmt(total))}`);
+  const s3 = mblock(...lines.map(mline));
+
+  return renderThreeStep(
+    `Y — Multi-Head Attention の射影出力 (concat · W_O)`,
+    s1, s2, s3,
+    `<p class="muted note">※ 本シミュレータでは W_O = 単位行列なので、Y = concat(attnOut)。各 head の出力がそのまま並ぶ identity 設計を hand-crafted で維持してある。</p>`,
+  );
+}
+
+// residual1[t, d] = X[t, d] + Y[t, d]   (残差接続: 元の token 情報を attention 出力に足し戻す)
+function renderResidual1(net, sel) {
+  const { row: t, col: d } = sel;
+  const D = net.d_model;
+  const x = net.X[t * D + d];
+  const y = net.Y[t * D + d];
+  const r = net.residual1[t * D + d];
+
+  const s1 = mblock(mline(
+    `${mv("residual1", "t,d")} ${mo("=")} ${mv("X", "t,d")} ${mo("+")} ${mv("Y", "t,d")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("residual1")}${mo("[")}${tokenLabel(net, t)}${mo(",")} d${d}${mo("]")} ${mo("=")} ` +
+    `${mv("X")}${mo("[")}${tokenLabel(net, t)}${mo(",")} d${d}${mo("]")} ${mo("+")} ` +
+    `${mv("Y")}${mo("[")}${tokenLabel(net, t)}${mo(",")} d${d}${mo("]")}`
+  ));
+  const s3 = mblock(mline(
+    `${mn(fmt(x))} ${mo("+")} ${mn(fmt(y))} ${mo("=")} ${mn(fmt(r))}`
+  ));
+
+  return renderThreeStep(
+    `residual1 — 残差接続 (元 token 情報 X を Multi-Head 出力 Y に足し戻す)`,
+    s1, s2, s3,
+    `<p class="muted note">※ 残差接続 (residual connection) の役目: attention で集めた情報 Y だけだと元の token 情報が失われがちなので、X をそのまま足し戻すことで「元の自分 + 周りから集めた情報」の合算ベクトルにする。深い Transformer での勾配消失を防ぐ働きもある。</p>`,
+  );
+}
+
+// ln1_out[t, d] = γ_d * (residual1[t, d] - μ_t) / sqrt(σ²_t + ε) + β_d
+function renderLN1(net, sel) {
+  const { row: t, col: d } = sel;
+  const D = net.d_model;
+  const block0 = net.blocks[0];
+  const gamma = block0.LN1_gamma[d];
+  const beta  = block0.LN1_beta[d];
+  // μ, σ² を行 t について計算
+  let mu = 0;
+  for (let dd = 0; dd < D; dd++) mu += net.residual1[t * D + dd];
+  mu /= D;
+  let var_ = 0;
+  for (let dd = 0; dd < D; dd++) {
+    const dx = net.residual1[t * D + dd] - mu;
+    var_ += dx * dx;
+  }
+  var_ /= D;
+  const eps = 1e-5;
+  const sigma = Math.sqrt(var_ + eps);
+  const r = net.residual1[t * D + d];
+  const x_norm = (r - mu) / sigma;
+  const y_out = gamma * x_norm + beta;
+
+  const s1 = mblock(mline(
+    `${mv("ln1_out", "t,d")} ${mo("=")} ` +
+    `${mv("γ", "d")} ${mo("·")} ${mo("(")}${mv("residual1", "t,d")} ${mo("-")} ${mv("μ", "t")}${mo(")")} ${mo("/")} ` +
+    `${mv("√(σ²")}<sub>t</sub>${mv(" + ε)")} ${mo("+")} ${mv("β", "d")}`
+  ));
+  const s2 = mblock(
+    mline(`${mv("μ", "t")} ${mo("=")} (1 / d_model) ${mv("Σ", "d'")} ${mv("residual1")}${mo("[")}${tokenLabel(net, t)}, d'${mo("]")} ${mo("=")} ${mn(mu.toFixed(4))}`),
+    mline(`${mv("σ²", "t")} ${mo("=")} (1 / d_model) ${mv("Σ", "d'")} ${mo("(")}${mv("residual1")}${mo("[")}${tokenLabel(net, t)}, d'${mo("]")} ${mo("-")} ${mv("μ", "t")}${mo(")²")} ${mo("=")} ${mn(var_.toFixed(4))}`),
+    mline(`${mv("√(σ²")}<sub>t</sub>${mv(" + ε)")} ${mo("=")} ${mn(sigma.toFixed(4))} <span class="comment">  (ε = 1e-5 で 0 除算回避)</span>`),
+  );
+  const s3 = mblock(
+    mline(`${mv("residual1")}${mo("[")}${tokenLabel(net, t)}, d${d}${mo("]")} ${mo("-")} ${mv("μ")} ${mo("=")} ${mn(fmt(r))} ${mo("-")} ${mn(mu.toFixed(4))} ${mo("=")} ${mn((r - mu).toFixed(4))}`),
+    mline(`${mo("(")}${mn((r - mu).toFixed(4))}${mo(")")} ${mo("/")} ${mn(sigma.toFixed(4))} ${mo("=")} ${mn(x_norm.toFixed(4))} <span class="comment">  (標準化された値)</span>`),
+    mline(`${mv("γ")}<sub>${d}</sub> ${mo("·")} ${mn(x_norm.toFixed(4))} ${mo("+")} ${mv("β")}<sub>${d}</sub> ${mo("=")} ${mn(gamma.toFixed(3))} ${mo("·")} ${mn(x_norm.toFixed(4))} ${mo("+")} ${mn(beta.toFixed(3))} ${mo("=")} ${mn(fmt(y_out))}`),
+  );
+
+  return renderThreeStep(
+    `ln1_out — Layer Normalization (per-token、d_model 軸方向の正規化)`,
+    s1, s2, s3,
+    `<p class="muted note">※ LayerNorm は各 token (= 各行) について d_model 軸の平均 μ と分散 σ² を取り、(x - μ) / √(σ² + ε) で標準化したあと γ・β でスケール/シフトする。本シミュレータの γ = 1, β = 0 では純粋な「平均 0、標準偏差 1」への正規化になり、token ごとに値の分布の大きさが揃う。実 Transformer では γ, β も学習で「適切なスケール」を獲得する。</p>`,
+  );
+}
+
+// ─── FFN (Feed-Forward Network、2 層 MLP + GELU) ──────────
+
+// preset の FFN 検出器ニューロン意図 (build_preset.py の FFN_NEURON_INTENT と同期)
+const FFN_NEURON_INTENT = {
+  0: "名詞 dim (d0) 検出器",
+  1: "形容詞 dim (d1) 検出器",
+  2: "指示詞 dim (d2) 検出器",
+  3: "述語 dim (d3) 検出器",
+  4: "助詞「は」(d4) 検出器",
+  5: "助詞「が」(d5) 検出器",
+  6: "助詞「を」(d6) 検出器",
+  7: "コピュラ「です」(d7) 検出器",
+  8: "美しさ特徴 (d8) 検出器",
+  9: "サイズ特徴 (d9) 検出器",
+  10: "書物特徴 (d10) 検出器",
+  11: "人気度特徴 (d11) 検出器",
+  12: "AND: 名詞 ∧ 美しさ → 美しい名詞検出 (d8 を強化)",
+  13: "AND: 名詞 ∧ サイズ → サイズを持つ名詞検出 (d9 を強化)",
+  14: "AND: 名詞 ∧ 書物 → 書物検出 (d10 を強化)",
+  15: "AND: 名詞 ∧ 人気度 → 人気な名詞検出 (d11 を強化)",
+};
+
+// W1 / W2 のセル — preset 由来の固定重み
+function renderFFNWeight(net, sel, which) {
+  const { row, col } = sel;
+  const block0 = net.blocks[0];
+  const W = which === "W1" ? block0.FFN_W1 : block0.FFN_W2;
+  const matName = `FFN_${which}`;
+  const inLabel = which === "W1" ? `d${row}` : `h${row}`;
+  const outLabel = which === "W1" ? `h${col}` : `d${col}`;
+  const cols = which === "W1" ? net.d_ff : net.d_model;
+  const w = W[row * cols + col];
+
+  const s1 = mblock(mline(
+    `${mv(matName, "in,out")} <span class="comment">  (= 入力 ${inLabel} の値を、出力 ${outLabel} にどれだけ流すか)</span>`
+  ));
+  const s2 = mblock(mline(
+    `${mv(matName)}${mo("[")}${inLabel}${mo(",")} ${outLabel}${mo("]")}`
+  ));
+  const s3 = mblock(mline(
+    `${mv(matName)}${mo("[")}${inLabel}${mo(",")} ${outLabel}${mo("]")} ${mo("=")} ${mn(fmt(w))}`
+  ));
+
+  let note = "";
+  if (which === "W1") {
+    const hk = col;
+    const intent = FFN_NEURON_INTENT[hk];
+    if (intent) {
+      note = `<p class="muted note">※ FFN_W1 の列 h${hk} は preset の検出器ニューロン: <b>${escapeHtml(intent)}</b>。各 token の ln1_out から該当 dim を「立っているか」判定する閾値ロジックを実現。</p>`;
+    } else {
+      note = `<p class="muted note">※ FFN_W1 の列 h${hk} は preset で未使用 (全 0)。</p>`;
+    }
+  } else {
+    const hk = row;
+    const intent = FFN_NEURON_INTENT[hk];
+    if (intent) {
+      note = `<p class="muted note">※ FFN_W2 の行 h${hk} (検出器: ${escapeHtml(intent)}) は、その活性を出力 d_model のどの dim に書き戻すかを定める。検出器の発火を「特定 dim の値強化」として後段に伝える。</p>`;
+    } else {
+      note = `<p class="muted note">※ h${hk} は preset で未使用なので、この行はすべて 0。</p>`;
+    }
+  }
+
+  return renderThreeStep(
+    `${matName} — FFN の射影重み (preset で hand-crafted)`,
+    s1, s2, s3,
+    note,
+  );
+}
+
+// ffn_h[t, k] = GELU(Σ_d ln1_out[t, d] · W1[d, k] + b1[k])
+function renderFFNHidden(net, sel) {
+  const { row: t, col: k } = sel;
+  const D = net.d_model;
+  const block0 = net.blocks[0];
+  const b1 = block0.FFN_b1[k];
+  const intent = FFN_NEURON_INTENT[k] ?? `h${k} (preset で未使用)`;
+
+  // 0 でない項のみ展開
+  let z = b1;
+  const lines2 = [];
+  for (let d = 0; d < D; d++) {
+    const w = block0.FFN_W1[d * net.d_ff + k];
+    if (Math.abs(w) < 1e-9) continue;
+    const x = net.ln1_out[t * D + d];
+    z += x * w;
+    lines2.push(
+      `${mv("ln1_out")}${mo("[")}${tokenLabel(net, t)}, d${d}${mo("]")} ${mo("·")} ${mv("W1")}${mo("[")}d${d}, h${k}${mo("]")} ${mo("=")} ` +
+      `${mn(fmt(x))} ${mo("·")} ${mn(fmt(w))} ${mo("=")} ${mn(fmt(x * w))}`
+    );
+  }
+  if (lines2.length === 0) {
+    lines2.push(`<span class="comment"># W1[d, h${k}] が全 d で 0 (= 検出器が preset で未使用)</span>`);
+  }
+  // GELU 計算
+  const GELU_COEF = Math.sqrt(2 / Math.PI);
+  const inner = GELU_COEF * (z + 0.044715 * z * z * z);
+  const ge = 0.5 * z * (1 + Math.tanh(inner));
+
+  const s1 = mblock(mline(
+    `${mv("ffn_h", "t,k")} ${mo("=")} ${mv("GELU")}${mo("(")}${mv("Σ", "d")} ${mv("ln1_out", "t,d")} ${mo("·")} ${mv("W1", "d,k")} ${mo("+")} ${mv("b1", "k")}${mo(")")}`
+  ));
+  const s2 = mblock(...lines2.map(mline),
+    mline(`${mv("b1")}${mo("[")}h${k}${mo("]")} ${mo("=")} ${mn(fmt(b1))}`),
+    mline(`${mv("Σ + b1")} ${mo("=")} ${mn(fmt(z))} <span class="comment">  (= GELU 入力 ffn_pre[t, h${k}])</span>`),
+  );
+  const s3 = mblock(mline(
+    `${mv("GELU")}${mo("(")}${mn(fmt(z))}${mo(")")} ${mo("=")} ${mn(fmt(ge))}`
+  ));
+
+  return renderThreeStep(
+    `ffn_h — FFN 中間層の検出器活性   [h${k}: ${intent}]`,
+    s1, s2, s3,
+    `<p class="muted note">※ GELU は ReLU と似た滑らかな活性化で、入力が大きく正なら ≈ x、負なら ≈ 0 を返す。本 preset では W1 を「特定 dim 同時発火検出器」として作ってあるので、ffn_h[t, k] が正の大きな値 = 「token t において k 番ニューロンが捉えた特徴が立っている」と読める。</p>`,
+  );
+}
+
+// ffn_out[t, d] = Σ_k ffn_h[t, k] · W2[k, d] + b2[d]
+function renderFFNOut(net, sel) {
+  const { row: t, col: d } = sel;
+  const block0 = net.blocks[0];
+  const d_ff = net.d_ff;
+  const b2 = block0.FFN_b2[d];
+
+  let total = b2;
+  const lines = [];
+  for (let k = 0; k < d_ff; k++) {
+    const w = block0.FFN_W2[k * net.d_model + d];
+    if (Math.abs(w) < 1e-9) continue;
+    const a = net.ffn_h[t * d_ff + k];
+    const prod = a * w;
+    total += prod;
+    const intent = FFN_NEURON_INTENT[k] ?? `h${k}`;
+    lines.push(
+      `${mv("ffn_h")}${mo("[")}t, h${k}${mo("]")} ${mo("·")} ${mv("W2")}${mo("[")}h${k}, d${d}${mo("]")} ${mo("=")} ` +
+      `${mn(fmt(a))} ${mo("·")} ${mn(fmt(w))} ${mo("=")} ${mn(fmt(prod))} <span class="comment">  (h${k}: ${escapeHtml(intent)})</span>`
+    );
+  }
+  if (lines.length === 0) {
+    lines.push(`<span class="comment"># W2[*, d${d}] が全 0 のため寄与なし</span>`);
+  }
+
+  const s1 = mblock(mline(
+    `${mv("ffn_out", "t,d")} ${mo("=")} ${mv("Σ", "k")} ${mv("ffn_h", "t,k")} ${mo("·")} ${mv("W2", "k,d")} ${mo("+")} ${mv("b2", "d")}`
+  ));
+  const s2 = mblock(...lines.map(mline),
+    mline(`${mv("b2")}${mo("[")}d${d}${mo("]")} ${mo("=")} ${mn(fmt(b2))}`),
+    mline(`${mv("ffn_out")}${mo("[")}${tokenLabel(net, t)}, d${d}${mo("]")} ${mo("=")} ${mn(fmt(total))}`),
+  );
+  const s3 = mblock(mline(
+    `合計 = ${mn(fmt(total))}`
+  ));
+
+  return renderThreeStep(
+    `ffn_out — FFN の出力 (検出器活性を d_model に書き戻し)`,
+    s1, s2, s3,
+    `<p class="muted note">※ W2 が「検出器の活性をどの dim に書き戻すか」を決めるので、発火した検出器に応じて出力 dim の特定 dim が強化される。本 preset では h12〜h15 の AND 検出器が「美しい名詞 → 美しさ +0.5」のように特徴 dim を上書き強化する。</p>`,
+  );
+}
+
+// residual2[t, d] = ln1_out[t, d] + ffn_out[t, d]
+function renderResidual2(net, sel) {
+  const { row: t, col: d } = sel;
+  const D = net.d_model;
+  const a = net.ln1_out[t * D + d];
+  const b = net.ffn_out[t * D + d];
+  const r = net.residual2[t * D + d];
+
+  const s1 = mblock(mline(
+    `${mv("residual2", "t,d")} ${mo("=")} ${mv("ln1_out", "t,d")} ${mo("+")} ${mv("ffn_out", "t,d")}`
+  ));
+  const s2 = mblock(mline(
+    `${mv("residual2")}${mo("[")}${tokenLabel(net, t)}, d${d}${mo("]")} ${mo("=")} ${mn(fmt(a))} ${mo("+")} ${mn(fmt(b))}`
+  ));
+  const s3 = mblock(mline(
+    `${mv("residual2")} ${mo("=")} ${mn(fmt(r))}`
+  ));
+
+  return renderThreeStep(
+    `residual2 — 2 回目の残差接続 (FFN 入力 + FFN 出力)`,
+    s1, s2, s3,
+    `<p class="muted note">※ FFN は「検出器が立った dim を強化」するだけの差分情報なので、元の ln1_out (= attention 部の出力) に足し戻して 2 回目の残差を作る。これにより attention で集めた情報も FFN で強化された情報もどちらも保持される。</p>`,
+  );
+}
+
+// ln2_out[t, d] = LayerNorm(residual2)
+function renderLN2(net, sel) {
+  const { row: t, col: d } = sel;
+  const D = net.d_model;
+  const block0 = net.blocks[0];
+  const gamma = block0.LN2_gamma[d];
+  const beta  = block0.LN2_beta[d];
+  let mu = 0;
+  for (let dd = 0; dd < D; dd++) mu += net.residual2[t * D + dd];
+  mu /= D;
+  let var_ = 0;
+  for (let dd = 0; dd < D; dd++) {
+    const dx = net.residual2[t * D + dd] - mu;
+    var_ += dx * dx;
+  }
+  var_ /= D;
+  const eps = 1e-5;
+  const sigma = Math.sqrt(var_ + eps);
+  const r = net.residual2[t * D + d];
+  const x_norm = (r - mu) / sigma;
+  const y_out = gamma * x_norm + beta;
+
+  const s1 = mblock(mline(
+    `${mv("ln2_out", "t,d")} ${mo("=")} ${mv("γ", "d")} ${mo("·")} ${mo("(")}${mv("residual2", "t,d")} ${mo("-")} ${mv("μ", "t")}${mo(")")} ${mo("/")} ${mv("√(σ²")}<sub>t</sub>${mv(" + ε)")} ${mo("+")} ${mv("β", "d")}`
+  ));
+  const s2 = mblock(
+    mline(`${mv("μ", "t")} ${mo("=")} ${mn(mu.toFixed(4))}, ${mv("σ²", "t")} ${mo("=")} ${mn(var_.toFixed(4))}, ${mv("√(σ²+ε)")} ${mo("=")} ${mn(sigma.toFixed(4))}`),
+  );
+  const s3 = mblock(
+    mline(`(${mn(fmt(r))} ${mo("-")} ${mn(mu.toFixed(4))}) ${mo("/")} ${mn(sigma.toFixed(4))} ${mo("=")} ${mn(x_norm.toFixed(4))}`),
+    mline(`${mv("γ")}<sub>${d}</sub> ${mo("·")} ${mn(x_norm.toFixed(4))} ${mo("+")} ${mv("β")}<sub>${d}</sub> ${mo("=")} ${mn(fmt(y_out))}`),
+  );
+
+  return renderThreeStep(
+    `ln2_out — 2 回目の Layer Normalization (block 最終出力)`,
+    s1, s2, s3,
+    `<p class="muted note">※ ln2_out が 1 ブロック分の最終出力。次のブロック (本シミュレータでは N=1 なので無し) または最終予測層への入力になる。LN の効果は Lesson 9 と同じ: 各 token の dim 分布を平均 0・標準偏差 1 に揃える。</p>`,
+  );
+}
+
+// ─── Attention Map (補助パネル常駐表示用、シンプルなテーブル HTML) ──
+
+function renderAttentionMapHtml(net) {
+  if (net.phase === "idle") {
+    return `<p class="muted">Forward 後、ここに attention map が常駐表示されます。</p>`;
+  }
+  const T = net.T;
+  const H = net.h;
+  // Multi-Head: head ごとに 1 つずつ table を縦に並べる。
+  let html = "";
+  for (let hi = 0; hi < H; hi++) {
+    html += `<div class="attmap-head"><h4 class="attmap-head-title">head ${hi}</h4>`;
+    html += `<table class="attmap-table"><thead><tr><th></th>`;
+    for (let j = 0; j < T; j++) {
+      html += `<th class="attmap-col">${escapeHtml(tokenLabel(net, j))}</th>`;
+    }
+    html += `</tr></thead><tbody>`;
+    const sBase = hi * T * T;
+    for (let i = 0; i < T; i++) {
+      html += `<tr><th class="attmap-row">${escapeHtml(tokenLabel(net, i))}</th>`;
+      for (let j = 0; j < T; j++) {
+        const v = net.attn[sBase + i * T + j];
+        const t = Math.max(0, Math.min(1, v));
+        const r = Math.round(255 - (255 - 43) * t);
+        const g = Math.round(255 - (255 - 108) * t);
+        const b = Math.round(255 - (255 - 176) * t);
+        const fg = v >= 0.5 ? "#fff" : "#222";
+        html += `<td class="attmap-cell" style="background:rgb(${r},${g},${b});color:${fg}">${v.toFixed(2)}</td>`;
+      }
+      html += `</tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  return html;
+}
+
+
+// ---------- controller.js ----------
+
+// controller.js — UI と model.js / view.js を接続するエントリポイント。
+// P4 では最小限: DEFAULT_PRESET をロードして、Sample セレクタで選んだ文に対し
+// forward を実行 → view.js で行列ヒートマップを描画する。
+// インタラクション (セルクリック、式の展開) は P5 で追加。
+
+
+// ─── DOM ────────────────────────────────────────────────────
+
+const $ = (id) => document.getElementById(id);
+
+const ui = {
+  lesson:       $("lesson"),
+  sample:       $("sample"),
+  btnForward:   $("btn-forward"),
+  btnReset:     $("btn-reset"),
+  phaseLabel:   $("phase-label"),
+
+  svg:          $("net-svg"),
+  btnZoomFit:   $("btn-zoom-fit"),
+  btnZoom100:   $("btn-zoom-100"),
+  btnZoomIn:    $("btn-zoom-in"),
+  btnZoomOut:   $("btn-zoom-out"),
+  zoomLabel:    $("zoom-label"),
+
+  explainBody:  $("explain-body"),
+  attmapBody:   $("attmap-body"),
+  lessonBody:   $("lesson-body"),
+
+  eventLog:     $("event-log"),
+};
+
+// ─── 状態 ───────────────────────────────────────────────────
+
+const state = {
+  net: null,
+  view: null,
+  sampleIdx: 0,
+  selection: null,    // { matrix, row, col } — クリックされたセル
+  currentLesson: null, // 選択中の Lesson (LESSONS のエントリ) | null
+};
+
+// ─── イベントログ ───────────────────────────────────────────
+
+function log(msg) {
+  const li = document.createElement("li");
+  li.textContent = msg;
+  ui.eventLog.appendChild(li);
+  ui.eventLog.scrollTop = ui.eventLog.scrollHeight;
+}
+
+// ─── 初期化 ─────────────────────────────────────────────────
+
+function init() {
+  // Lesson セレクタ
+  for (const lsn of LESSONS) {
+    const opt = document.createElement("option");
+    opt.value = lsn.id;
+    opt.textContent = lsn.title;
+    ui.lesson.appendChild(opt);
+  }
+
+  // Sample セレクタ
+  for (let i = 0; i < SAMPLE_SENTENCES.length; i++) {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = `#${i + 1}  ${SAMPLE_SENTENCES[i].join(" ")}`;
+    ui.sample.appendChild(opt);
+  }
+  ui.sample.value = "0";
+
+  // Net + view を構築
+  state.net = createTransformer({ preset: DEFAULT_PRESET });
+  state.view = createView(ui.svg, state.net, {
+    onCellClick: onCellClick,
+  });
+
+  // 起動直後は最初のサンプルを net.tokens に書き込んでから (forward 前の状態で)
+  // 描画する。これで Embed タブには W_E のままが見える状態になる。
+  previewSampleInput();
+  renderAll(state.view);
+  // 初回ロード時は中央パネルを Fit 表示にする (viewBox は createView の初期値 1000×600 で
+  // 立ち上がるが、Embed タブの自然サイズはそれと違うため)。
+  // SVG のレイアウトが確定してからラベルを更新するため rAF を使う。
+  applyZoomFit(state.view);
+  requestAnimationFrame(updateZoomLabel);
+
+  // タブ
+  document.querySelectorAll(".view-tabs .tab").forEach((btn) => {
+    btn.addEventListener("click", () => onViewTabClick(btn));
+  });
+  document.querySelectorAll(".side-tabs .tab").forEach((btn) => {
+    btn.addEventListener("click", () => onSideTabClick(btn));
+  });
+
+  // ボタン
+  ui.btnForward.addEventListener("click", onForward);
+  ui.btnReset.addEventListener("click", onReset);
+  ui.sample.addEventListener("change", onSampleChange);
+  ui.lesson.addEventListener("change", onLessonChange);
+
+  // pan/zoom コントロール
+  ui.btnZoomFit.addEventListener("click", () => {
+    applyZoomFit(state.view);
+    updateZoomLabel();
+  });
+  ui.btnZoom100.addEventListener("click", () => {
+    applyZoom100(state.view);
+    updateZoomLabel();
+  });
+  // +10% は viewBox を 1/1.1 倍 (= 視覚を 1.1 倍に拡大)。−10% は逆。
+  ui.btnZoomIn.addEventListener("click", () => {
+    applyZoomDelta(state.view, 1 / 1.1);
+    updateZoomLabel();
+  });
+  ui.btnZoomOut.addEventListener("click", () => {
+    applyZoomDelta(state.view, 1.1);
+    updateZoomLabel();
+  });
+  ui.svg.addEventListener("wheel", () => {
+    // wheel 後のズーム倍率を表示更新 (view.js 側で viewBox は更新済み)
+    requestAnimationFrame(updateZoomLabel);
+  });
+  // ドラッグ pan は viewBox.x/y のみ動かし倍率は変えないので更新不要
+
+  // 補助パネルの「レッスン」タブに初期メッセージを描画
+  renderLessonCard();
+
+  log("[Init] preset=japanese-mini-v1, T=5, d_model=16, h=1");
+}
+
+function updateZoomLabel() {
+  const z = currentZoom(state.view);
+  ui.zoomLabel.textContent = `${z.toFixed(2)}×`;
+}
+
+// Sample 変更や Reset 後に「forward 前の状態」を準備する:
+// - net.tokens に選択中サンプルの id 列を入れる
+// - net.X 等は forward が走ってないのでクリア状態 (= reset() で 0 化)
+function previewSampleInput() {
+  const sample = SAMPLE_SENTENCES[state.sampleIdx];
+  const ids = encode(sample);
+  reset(state.net);
+  // tokens は reset() で 0 にされるので、上書きする
+  for (let t = 0; t < state.net.T; t++) state.net.tokens[t] = ids[t];
+  // Embed タブに W_E + W_P が見えるよう、X だけ事前計算する。
+  // (P4 では「Forward 前の状態でも何か絵が出る」のが大事。Q/K/V は 0 のまま)
+  for (let t = 0; t < state.net.T; t++) {
+    const off = t * state.net.d_model;
+    const wOff = state.net.tokens[t] * state.net.d_model;
+    const pOff = t * state.net.d_model;
+    for (let d = 0; d < state.net.d_model; d++) {
+      state.net.X[off + d] = state.net.W_E[wOff + d] + state.net.W_P[pOff + d];
+    }
+  }
+  setPhase("idle (input previewed)");
+}
+
+function setPhase(label) {
+  ui.phaseLabel.textContent = label;
+}
+
+function refreshExplain() {
+  ui.explainBody.innerHTML = renderExplainHtml({
+    net: state.net,
+    selection: state.selection,
+  });
+}
+
+function refreshAttentionMap() {
+  ui.attmapBody.innerHTML = renderAttentionMapHtml(state.net);
+}
+
+function onCellClick({ matrix, row, col }) {
+  state.selection = { matrix, row, col };
+  setSelection(state.view, state.selection);
+  refreshExplain();
+  // クリックしたら自動で「式の展開」タブにフォーカスする
+  activateSideTab("explain");
+}
+
+function activateSideTab(name) {
+  document.querySelectorAll(".side-tabs .tab").forEach((b) => {
+    b.classList.toggle("tab-active", b.getAttribute("data-side-tab") === name);
+  });
+  document.querySelectorAll("[data-side-panel]").forEach((p) => {
+    p.classList.toggle("tab-panel-active", p.getAttribute("data-side-panel") === name);
+  });
+}
+
+function activateViewTab(name) {
+  document.querySelectorAll(".view-tabs .tab").forEach((b) => {
+    b.classList.toggle("tab-active", b.getAttribute("data-view-tab") === name);
+  });
+  setTab(state.view, name);
+  updateZoomLabel();
+}
+
+function renderLessonCard() {
+  const lsn = state.currentLesson;
+  if (!lsn) {
+    ui.lessonBody.innerHTML = `
+      <p class="muted">
+        Lesson セレクタから Lesson 1〜Lesson 10 を選ぶと、ここに目的と「このレッスンでチェックすること (3 つ)」が表示されます。
+      </p>`;
+    return;
+  }
+  const checks = lsn.checks
+    .map((c) => `<li>${escapeAndBold(c)}</li>`)
+    .join("");
+  ui.lessonBody.innerHTML = `
+    <div class="lesson-card">
+      <h3>${escapeHtml(lsn.title)}</h3>
+      <p class="lesson-hint">${escapeAndBold(lsn.hint)}</p>
+      <h4>このレッスンでチェックすること</h4>
+      <ol class="lesson-checks">${checks}</ol>
+    </div>`;
+}
+
+// (escapeHtml は explain.js から import 済み)
+
+// ─── イベントハンドラ ────────────────────────────────────
+
+function onSampleChange() {
+  state.sampleIdx = parseInt(ui.sample.value, 10) || 0;
+  state.selection = null;
+  // Sample を変えても Lesson 選択は保持する。
+  // (例: Lesson 2 Task 2 では「Sample を別文に切り替えても W_P が同じ」を観察する手順がある)
+  // Lesson の sampleIdx と異なる Sample を選んだ場合は、現在の選択値で forward 状態を作り直す。
+  previewSampleInput();
+  if (state.currentLesson && state.currentLesson.runForward) {
+    const ids = encode(SAMPLE_SENTENCES[state.sampleIdx]);
+    forward(state.net, ids);
+    setPhase("forward (sample change in lesson)");
+  }
+  renderAll(state.view);
+  refreshExplain();
+  refreshAttentionMap();
+  log(`[Sample] #${state.sampleIdx + 1}: ${SAMPLE_SENTENCES[state.sampleIdx].join(" ")}`);
+}
+
+function onLessonChange() {
+  const id = ui.lesson.value;
+  if (!id) {
+    state.currentLesson = null;
+    renderLessonCard();
+    return;
+  }
+  const lsn = getLesson(id);
+  if (!lsn) return;
+  state.currentLesson = lsn;
+  // Lesson に従って Sample / View タブ / Forward を一括適用
+  state.sampleIdx = lsn.sampleIdx;
+  ui.sample.value = String(lsn.sampleIdx);
+  state.selection = null;
+  previewSampleInput();
+  if (lsn.runForward) {
+    const ids = encode(SAMPLE_SENTENCES[state.sampleIdx]);
+    forward(state.net, ids);
+    setPhase("forward (lesson auto)");
+  } else {
+    setPhase("idle (lesson preview)");
+  }
+  // 中央タブを Lesson 指定に合わせる
+  activateViewTab(lsn.viewTab);
+  // 補助パネルは「レッスン」タブをアクティブに
+  activateSideTab("lesson");
+  // 描画 / 各パネル更新
+  renderAll(state.view);
+  refreshExplain();
+  refreshAttentionMap();
+  renderLessonCard();
+  log(`[Lesson] ${lsn.id}: ${lsn.title}`);
+}
+
+function onForward() {
+  const sample = SAMPLE_SENTENCES[state.sampleIdx];
+  const ids = encode(sample);
+  forward(state.net, ids);
+  setPhase("forward");
+  renderAll(state.view);
+  refreshExplain();
+  refreshAttentionMap();
+  // 主要 attention 関係をログに (Multi-Head: 各 head ごとに記録)
+  const attn = state.net.attn;
+  const T = state.net.T;
+  const H = state.net.h;
+  const headLabel = `[Forward] ${sample.join(" ")}`;
+  for (let hi = 0; hi < H; hi++) {
+    const sBase = hi * T * T;
+    const lines = [];
+    for (let i = 0; i < T; i++) {
+      let bestJ = 0, bestV = -1;
+      for (let j = 0; j < T; j++) {
+        const v = attn[sBase + i * T + j];
+        if (v > bestV) { bestV = v; bestJ = j; }
+      }
+      const queryWord = state.net.vocab[state.net.tokens[i]];
+      const keyWord   = state.net.vocab[state.net.tokens[bestJ]];
+      lines.push(`${queryWord} → ${keyWord} (${bestV.toFixed(2)})`);
+    }
+    log(`${headLabel} head${hi}: ${lines.join(",  ")}`);
+  }
+}
+
+function onReset() {
+  reset(state.net);
+  state.selection = null;
+  previewSampleInput();
+  renderAll(state.view);
+  refreshExplain();
+  refreshAttentionMap();
+  log(`[Reset]`);
+}
+
+function onViewTabClick(btn) {
+  const tab = btn.getAttribute("data-view-tab");
+  document.querySelectorAll(".view-tabs .tab").forEach((b) => {
+    b.classList.toggle("tab-active", b === btn);
+  });
+  setTab(state.view, tab);
+  updateZoomLabel();
+}
+
+function onSideTabClick(btn) {
+  const tab = btn.getAttribute("data-side-tab");
+  document.querySelectorAll(".side-tabs .tab").forEach((b) => {
+    b.classList.toggle("tab-active", b === btn);
+  });
+  document.querySelectorAll("[data-side-panel]").forEach((p) => {
+    p.classList.toggle("tab-panel-active", p.getAttribute("data-side-panel") === tab);
+  });
+}
+
+// ─── 起動 ───────────────────────────────────────────────────
+
+init();
+
+</script>
+  </body>
+</html>

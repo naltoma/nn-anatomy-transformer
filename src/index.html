@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NN Anatomy — Transformer</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <!-- [A] コントロールバー ────────────────────────────────── -->
+    <header id="controls" class="pane pane-controls">
+      <div class="row">
+        <label>
+          Lesson
+          <select id="lesson">
+            <option value="" selected>— (custom)</option>
+            <!-- controller.js が LESSONS から option を生成 -->
+          </select>
+        </label>
+
+        <label>
+          Sample
+          <select id="sample">
+            <!-- controller.js が tokenizer の SAMPLE_SENTENCES から生成 -->
+          </select>
+        </label>
+
+        <button id="btn-forward">Forward</button>
+        <button id="btn-reset">Reset</button>
+
+        <span class="spacer"></span>
+
+        <span class="phase-badge">
+          phase: <span id="phase-label">idle</span>
+        </span>
+      </div>
+    </header>
+
+    <!-- [B] ネットワーク・ビュー ───────────────────────────── -->
+    <main id="network" class="pane pane-network">
+      <nav class="tabs view-tabs" role="tablist">
+        <button class="tab tab-active" data-view-tab="embed">Embed</button>
+        <button class="tab" data-view-tab="qkv">Q/K/V</button>
+        <button class="tab" data-view-tab="attn">Attn</button>
+        <button class="tab" data-view-tab="out">Out</button>
+        <button class="tab" data-view-tab="ffn">FFN</button>
+      </nav>
+      <div class="zoom-controls">
+        <button id="btn-zoom-fit" title="全体表示にリセット">⤢ Fit</button>
+        <button id="btn-zoom-100" title="100% 表示">100%</button>
+        <button id="btn-zoom-out" title="−10% (中心アンカー)">−10%</button>
+        <button id="btn-zoom-in"  title="+10% (中心アンカー)">+10%</button>
+        <span id="zoom-label" class="zoom-label">1.0×</span>
+      </div>
+      <svg id="net-svg" role="img" aria-label="transformer matrices">
+        <!-- view.js が描画する -->
+      </svg>
+    </main>
+
+    <!-- [C] 補助パネル ────────────────────────────────────── -->
+    <aside id="side" class="pane pane-side">
+      <nav class="tabs side-tabs" role="tablist">
+        <button class="tab tab-active" data-side-tab="explain">式の展開</button>
+        <button class="tab" data-side-tab="attmap">Attention Map</button>
+        <button class="tab" data-side-tab="lesson">レッスン</button>
+        <button class="tab" data-side-tab="log">イベントログ</button>
+      </nav>
+
+      <section class="tab-panel tab-panel-active" data-side-panel="explain">
+        <div id="explain-body">
+          <p class="muted">
+            行列のセル (例: Q[T2 美しい, 3]) をクリックすると、ここにそのセルの計算式が表示されます (P5 で実装予定)。
+          </p>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-side-panel="attmap">
+        <div id="attmap-body">
+          <p class="muted">
+            Forward 後、Attention Map (T × T) がここに常駐表示されます (P5 で実装予定)。
+          </p>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-side-panel="lesson">
+        <div id="lesson-body">
+          <p class="muted">
+            Lesson セレクタから Lesson 1〜Lesson 10 を選ぶと、ここに目的と「このレッスンでチェックすること (3 つ)」が表示されます。
+          </p>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-side-panel="log">
+        <ol id="event-log" class="event-log"></ol>
+      </section>
+    </aside>
+
+    <script type="module" src="./js/controller.js"></script>
+  </body>
+</html>
