@@ -6,7 +6,7 @@
 
 ## 起動方法
 
-セットアップ不要。`build/nn_sim_transformer.html` をブラウザで開くだけ。
+セットアップ不要。[`build/nn_sim_transformer.html`](build/nn_sim_transformer.html) をブラウザで開くだけ。
 
 ```bash
 # リポジトリをクローンしたら、
