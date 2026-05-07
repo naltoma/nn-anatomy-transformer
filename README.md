@@ -77,6 +77,8 @@ CDN や外部依存は無い (単一 HTML、~180 KB)。`file://` 経由でもオ
 | ファイル | 内容 |
 |---|---|
 | [`docs/design.md`](docs/design.md) | 全機能仕様 (v0.4)、数式、preset 構築指針、多ブロック化の検討案 |
+| [`docs/math-notes-transformer.md`](docs/math-notes-transformer.md) | 数式リファレンス (LayerNorm / GELU / Scaled Dot-Product Attention / FFN 検出器設計、block 全体の流れ、参考文献) |
+| [`docs/lesson-plans-transformer.md`](docs/lesson-plans-transformer.md) | 教員向け指導案 (授業設計 3 パターン、各 Lesson の学習目標 / つまずき / 補足質問、演習問題例) |
 | [`docs/implementation-notes.md`](docs/implementation-notes.md) | 実装ログ (フェーズごとの完了内容と決定事項) |
 | [`docs/initial-readme.md`](docs/initial-readme.md) | プロジェクト初期 (P0 設計フェーズ) の README をアーカイブ |
 

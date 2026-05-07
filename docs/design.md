@@ -18,6 +18,7 @@
   - 「Tier 2 = h=2, d_k=8」「3 bond を 2 head に分散 (head 0 = adj/pron→noun, head 1 = pred→noun)」を確定設計として記述。
   - Lesson 文中の数値 (scores 値、attn 値、ffn_h 検出器発火など) を Python テストで自動検証する仕組みを追加 (`tests/py/test_lesson_values.py`)。
   - 多ブロック化 (P8) を「現状を踏まえた検討案」として §3.4 に追記。
+  - 教材ドキュメントとして [`math-notes-transformer.md`](math-notes-transformer.md) と [`lesson-plans-transformer.md`](lesson-plans-transformer.md) を追加。
 
 ---
 
@@ -665,12 +666,13 @@ Lesson 文中の具体的数値 (例: `scores[h0, T2 美しい, T3 花] = +3.526
 
 ```
 nn-anatomy-transformer/
-├── README.md
+├── README.md                      利用者向け
 ├── docs/
-│   ├── design.md                  本書 (全機能仕様)
-│   ├── math-notes-transformer.md  数式リファレンス (P8 で完備)
-│   ├── lesson-plans-transformer.md  90 分授業向けプラン
-│   └── implementation-notes.md    実装ログ (フェーズごと)
+│   ├── design.md                  本書 (全機能仕様 v0.4)
+│   ├── math-notes-transformer.md  数式リファレンス (LayerNorm / GELU / Attention / FFN)
+│   ├── lesson-plans-transformer.md 教員向け指導案 (授業設計、Lesson ごとの学習目標とつまずき)
+│   ├── implementation-notes.md    実装ログ (フェーズごと)
+│   └── initial-readme.md          P0 段階の README アーカイブ
 ├── src/
 │   ├── index.html                 UI エントリ
 │   ├── style.css                  スタイル (行列ヒートマップ、pan/zoom)
@@ -721,7 +723,8 @@ MLP 版 v1 から **そのまま流用**: `rng.js` (内部の決定的乱数の�
 | P7a | Multi-Head Attention (h=2, d_k=8) + Lesson 8 | ✅ 完了 |
 | P7b | 残差接続 + LayerNorm + Lesson 9 | ✅ 完了 |
 | P7c | FFN (2 層 MLP, GELU) + Lesson 10 | ✅ 完了 |
-| **P8** | **多ブロック化 (案) + 複数 Preset 切替 + Lesson 11 + ドキュメント完備** | 🟡 未着手 (§3.4 参照) |
+| **P8** | **多ブロック化 (案) + 複数 Preset 切替 + Lesson 11** | 🟡 未着手 (§3.4 参照) |
+| **P8 部分実装** | math-notes-transformer.md / lesson-plans-transformer.md | ✅ 完了 (2026-05) |
 
 **v0.4 時点で P0〜P7c 完了**、Lesson 1〜10 で 1 ブロック分の forward 全工程を観察可能。
 
